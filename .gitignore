@@ -1,0 +1,55 @@
+node_modules/
+
+screenshots/
+recordings/
+traces/
+downloads/
+.playwright-browsers/
+qa-report.html
+
+auth*.json
+*.auth.json
+*.webm
+*.png
+*.zip
+*.log
+
+# Keep committed visual baselines versioned while runtime captures stay ignored.
+!tests/visual-baselines/
+!tests/visual-baselines/**/*.png
+
+# Auto-generated entries
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+dist/
+build/
+*.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Sensitive files (auto-detected)
+node_modules
+

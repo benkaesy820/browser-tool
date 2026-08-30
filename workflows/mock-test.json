@@ -1,0 +1,27 @@
+{
+  "preset": "desktop",
+  "steps": [
+    {
+      "action": "mockRoute",
+      "url": "**/api/user-status",
+      "status": 200,
+      "body": { "username": "John Doe", "role": "admin" },
+      "description": "Mock user status API response"
+    },
+    {
+      "action": "navigate",
+      "url": "https://example.com",
+      "description": "Navigate to app"
+    },
+    {
+      "action": "evaluate",
+      "script": "fetch('/api/user-status').then(r => r.json())",
+      "description": "Call mocked API from in-page JavaScript"
+    },
+    {
+      "action": "assert",
+      "selector": "h1",
+      "containsText": "Example Domain"
+    }
+  ]
+}
