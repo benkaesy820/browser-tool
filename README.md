@@ -33,19 +33,82 @@ Send one JSON object per line:
 
 ```json
 {"requestId":"1","op":"open","sessionId":"app","url":"http://localhost:5173","maxItems":30}
-{"requestId":"2","op":"act","sessionId":"app","action":"click","ref":"e3"}
+{"requestId":"2","op":"act","sessionId":"app","action":"click","ref":"e3","observe":true,"mode":"delta"}
+{"requestId":"2b","op":"batch","sessionId":"app","steps":[{"action":"fill","selector":"#email","text":"test@example.com"},{"action":"click","selector":"button[type=submit]"}],"observeAfter":"delta"}
 {"requestId":"3","op":"observe","sessionId":"app","mode":"delta","maxText":500}
 {"requestId":"4","op":"close","sessionId":"app"}
 {"requestId":"5","op":"quit"}
 ```
 
-Every response echoes `requestId`; errors include a machine-readable `code`. `open` and `observe` return page identity, headings, landmarks, bounded visible text, diagnostics, and interactive controls with stable references such as `e1`. References are invalidated after actions; observe again before acting. Use `--max-items` and `--max-text` to control token use.
+Every response echoes `requestId`; errors include a machine-readable `code`. `open` and `observe` return page identity, headings, landmarks, bounded visible text, diagnostics, and interactive controls with stable references such as `e1`. References are invalidated after actions, but stale refs are auto-recovered when the element is unambiguous (identity re-match with element-id fingerprint verification, reported as `refRecovered`; every act also reports `actedOn`), and ambiguous or missing elements fail fast with an evidenced `STALE_REF` error. Use `--max-items` and `--max-text` to control token use.
 
 Send `{"op":"capabilities"}` first when an agent needs the protocol version, supported session/workflow actions, observation modes, event names, safety modes, or limits. The response includes default limits and maximum guardrails so an agent can plan bounded requests without trial and error.
 
 Use `mode:"delta"` on later session observations to receive only changed page fields and controls. `since` refers to the last observation generation; if it is stale, the tool safely falls back to a full observation.
 
 Supported session actions include `click`, `fill`, `type`, `check`, `uncheck`, `select`, `selectOption`, `hover`, `press`, `scroll`, `navigate`, `goto`, `wait`, `assert`, `dialog`, `download`, `permissions`, and `screenshot`. Workflow-only actions additionally include `upload`, `setInputFiles`, `dragAndDrop`, `drag`, `switchTab`, `mockRoute`, `mockApi`, `saveState`, `scrape`, `getText`, and `evaluate`.
+
+## Agent-loop efficiency features
+
+These capabilities are part of the tool; `capabilities` advertises all of them.
+
+**One round-trip act + observe (recommended default loop).** `act` accepts
+`observe: true` and `mode: "delta"`:
+
+```json
+{"requestId":"7","op":"act","sessionId":"app","action":"click","ref":"e3","observe":true,"mode":"delta"}
+```
+
+The response carries `observation`, so the act → re-observe pair becomes one request.
+This option existed but was undocumented; agents should use it after every action.
+
+**Stale-ref auto-recovery.** Refs are invalidated after every act. When an act uses a
+ref that is no longer current, the tool re-matches the element using the semantic
+identity recorded at observation time (`role` + `name` + `nth` + group size). Recovery
+only succeeds when the group size is unchanged, so a re-render can never silently
+redirect an action. Recovered acts include `refRecovered`; everything else fails with
+the evidenced `STALE_REF` error as before. Disable per request with `recoverRef: false`
+or per session with `autoRecoverRefs: false` on `open`.
+
+**`batch` — several acts in one request.** Sequential steps with per-step evidence and
+stop-on-first-error by default:
+
+```json
+{"requestId":"8","op":"batch","sessionId":"app","steps":[
+  {"action":"fill","selector":"#email","text":"test@example.com"},
+  {"action":"click","selector":"button[type=submit]"},
+  {"action":"assert","selector":"h1","containsText":"Dashboard"}
+],"observeAfter":"delta"}
+```
+
+Selectors are the reliable addressing mode inside a batch because refs invalidate
+after every act. Response: `status` (`ok`/`partial`/`error`), `steps[]`, `failedStep`,
+`passedSteps`, optional inline `observation`. Maximum 25 steps.
+
+**Observation views.** `observe` and `open` accept `view: "controls"` to skip text,
+headings, and landmarks — roughly half the tokens for interaction-heavy loops.
+`view: "standard"` (default) is unchanged.
+
+**`tabs` — visible, controllable popups.** Sites that open popups already switch the
+active page; now the tool also emits a `page.opened` event and provides
+`{"op":"tabs","action":"list"|"switch"|"close","index":n}`. Closing the active tab is
+rejected; switch first. Switching increments `generation` and clears refs.
+
+**Coalesced diagnostics.** Repeated identical console/network diagnostics collapse into
+one entry with a `count` field, so a page that logs the same error 50 times costs one
+bounded entry.
+
+**Gated session `evaluate`.** Open a session with `allowEvaluate: true` to use
+`{"op":"act","action":"evaluate","fn":"(arg) => document.title","arg":42}` for debugging.
+Still blocked in safe mode; `capabilities.optionalSessionActions` documents the gate.
+
+**Idempotent close.** Closing an already-disposed (expired or double-closed) session
+returns `{status:"closed","alreadyClosed":true}` instead of `SESSION_NOT_FOUND`, so
+agent cleanup paths never need special cases. Never-existing ids still error.
+
+**`sessions` discovery.** `{"op":"sessions"}` lists active sessions (id, url,
+safetyMode, generation, expiry countdown, watcher counts) so an agent can recover after
+a crash without guessing.
 
 ## Event-driven sessions
 
@@ -95,7 +158,6 @@ Useful reliability controls:
 - `--mode=smoke|standard|release` selects one desktop view, desktop+mobile, or all supported viewports for `qa` (standard is the default). Smoke skips mobile layout unless a mobile preset is explicitly selected.
 - `--max-small-tap-targets=<n>` makes reported mobile tap-target findings a QA gate; without it, QA reports them without failing the run.
 - `--no-freeze` keeps animations running; captures freeze transitions and wait for fonts/images by default to reduce flaky diffs.
-- `--chaos --chaos-seed=test-1` exercises failures with a repeatable request-abort/jitter sequence.
 - `--trace=on-failure` keeps a Playwright trace only when a workflow fails or has a warning.
 - `--allow-warnings` keeps a soft workflow warning from becoming a failing CLI exit code.
 - `--max-output-chars` caps one JSON response at a valid structured boundary (default: 20,000 characters).

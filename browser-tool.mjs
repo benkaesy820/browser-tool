@@ -61,12 +61,13 @@ const MAX_SESSION_WATCHERS = 32;
 const MAX_VIEWPORT_DIMENSION = 10000;
 const TRACE_MODES = new Set(['off', 'on', 'on-failure']);
 const SAFETY_MODES = new Set(['standard', 'safe', 'unsafe']);
-const SESSION_OPERATIONS = new Set(['capabilities', 'open', 'observe', 'act', 'subscribe', 'unsubscribe', 'watch', 'unwatch', 'close', 'quit', 'exit']);
+const SESSION_OPERATIONS = new Set(['capabilities', 'sessions', 'open', 'observe', 'act', 'batch', 'tabs', 'subscribe', 'unsubscribe', 'watch', 'unwatch', 'close', 'quit', 'exit']);
 const AGENT_ACTIONS = new Set(['click', 'fill', 'type', 'check', 'uncheck', 'select', 'selectOption', 'hover', 'press', 'scroll', 'navigate', 'goto', 'wait', 'assert', 'dialog', 'download', 'permissions', 'screenshot']);
 const WORKFLOW_ACTIONS = new Set(['navigate', 'goto', 'upload', 'setInputFiles', 'dragAndDrop', 'drag', 'switchTab', 'mockRoute', 'mockApi', 'saveState', 'dialog', 'download', 'permissions', 'click', 'fill', 'type', 'check', 'uncheck', 'select', 'selectOption', 'press', 'hover', 'scroll', 'wait', 'assert', 'scrape', 'getText', 'screenshot', 'evaluate']);
-const SESSION_EVENT_NAMES = new Set(['navigation', 'navigation.blocked', 'console.error', 'console.warning', 'network.error', 'request.failed', 'page.crash', 'page.closed', 'dialog', 'download', 'watch.matched', 'watch.timeout', 'watch.error']);
+const SESSION_EVENT_NAMES = new Set(['navigation', 'navigation.blocked', 'console.error', 'console.warning', 'network.error', 'request.failed', 'page.crash', 'page.closed', 'page.opened', 'dialog', 'download', 'watch.matched', 'watch.timeout', 'watch.error']);
 const DEFAULT_SESSION_EVENTS = [...SESSION_EVENT_NAMES];
 const MAX_WORKFLOW_STEPS = 200;
+const MAX_BATCH_STEPS = 25;
 const MAX_WORKFLOW_FILE_BYTES = 2_000_000;
 const DEFAULT_WATCH_TIMEOUT = 30_000;
 const MAX_WATCH_TIMEOUT = 10 * 60 * 1000;
@@ -80,12 +81,16 @@ const NON_IDEMPOTENT_WORKFLOW_ACTIONS = new Set([
 const DEFAULT_VISUAL_STABILITY_TIMEOUT = 5000;
 const MAX_WORKFLOW_RETRIES = 10;
 const CLI_BOOLEAN_OPTIONS = new Set([
-  'allow-sensitive-trace', 'allow-overflow', 'allow-warnings', 'all', 'chaos',
-  'force', 'fullpage', 'headless', 'html-report', 'json', 'no-freeze',
-  'record', 'redact', 'report', 'retry-side-effects', 'safe', 'screenshot',
+  'allow-sensitive-trace', 'allow-overflow', 'allow-warnings', 'all',
+  'force', 'fullpage', 'headless', 'json', 'no-freeze',
+  'record', 'redact', 'retry-side-effects', 'safe', 'screenshot',
   'skip-layout', 'snapshots', 'unsafe'
 ]);
 const activeAgentSessions = new Map();
+// Session ids disposed moments ago, so cleanup `close` calls can be idempotent
+// (an agent that was told SESSION_EXPIRED should not then trip over its own
+// cleanup with SESSION_NOT_FOUND). Bounded to avoid unbounded growth.
+const recentlyDisposedSessions = new Map();
 const configuredContextFeatures = new WeakSet();
 
 const VISUAL_STABILITY_CSS = `
@@ -266,7 +271,7 @@ function isHttpUrl(url) {
 }
 
 async function configureContextFeatures(context, page, options = {}) {
-  const { network, redact, token, cookie, chaos, chaosSeed, geo, timezone, url } = options;
+  const { network, redact, token, cookie, geo, timezone, url } = options;
 
   // 1. Direct Token Injection. Keep credentials scoped to the target origin.
   if (token && !url) throw new Error('Token injection requires a target URL for origin scoping.');
@@ -314,23 +319,12 @@ async function configureContextFeatures(context, page, options = {}) {
   }
 
   if (firstContextConfiguration) {
-    const random = chaos && chaosSeed !== undefined && chaosSeed !== null
-      ? createSeededRandom(chaosSeed)
-      : Math.random;
-    // 4. Credentials and chaos use one context route so authorization is not
+    // 4. Credentials use one context route so authorization is not
     // sent to third-party assets or lost when a popup opens.
-    if (authHeader || chaos) {
+    if (authHeader) {
       await context.route('**/*', async (route) => {
         try {
           const requestUrl = new URL(route.request().url());
-          if (chaos && random() < 0.08) {
-            await route.abort();
-            return;
-          }
-          if (chaos) {
-            const jitterMs = Math.floor(random() * 800) + 100;
-            await new Promise(resolve => setTimeout(resolve, jitterMs));
-          }
           const headers = { ...route.request().headers() };
           if (authHeader && (!targetOrigin || requestUrl.origin === targetOrigin)) headers.authorization = authHeader;
           await route.continue({ headers });
@@ -379,15 +373,6 @@ function parseViewportSize(size) {
 function resolveTargetScope(page, frameSelector) {
   if (!frameSelector) return page;
   return page.frameLocator(frameSelector);
-}
-
-function createSeededRandom(seed) {
-  const digest = crypto.createHash('sha256').update(String(seed)).digest();
-  let state = digest.readUInt32LE(0);
-  return () => {
-    state = (Math.imul(1664525, state) + 1013904223) >>> 0;
-    return state / 0x100000000;
-  };
 }
 
 function redactSensitiveText(value) {
@@ -466,6 +451,31 @@ function validateSessionRequest(request) {
   if (operation === 'open') requireString(request.url, 'MISSING_URL', 'open url');
   if (operation === 'observe') {
     if (request.mode !== undefined && request.mode !== 'full' && request.mode !== 'delta') throw new BrowserToolError('INVALID_OBSERVE_MODE', 'observe mode must be full or delta.');
+    if (request.view !== undefined && !['standard', 'controls'].includes(request.view)) throw new BrowserToolError('INVALID_OBSERVE_VIEW', 'observe view must be standard or controls.');
+  }
+  if (operation === 'batch') {
+    if (!Array.isArray(request.steps) || request.steps.length === 0) throw new BrowserToolError('INVALID_BATCH', 'batch steps must be a non-empty array.');
+    if (request.steps.length > MAX_BATCH_STEPS) throw new BrowserToolError('BATCH_TOO_LARGE', `batch cannot contain more than ${MAX_BATCH_STEPS} steps.`);
+    request.steps.forEach((step, index) => {
+      if (!step || typeof step !== 'object' || Array.isArray(step)) {
+        throw new BrowserToolError('INVALID_BATCH_STEP', `batch step ${index + 1} must be a JSON object.`);
+      }
+      const stepAction = requireString(step.action, 'INVALID_BATCH_STEP', `batch step ${index + 1} action`);
+      if (!AGENT_ACTIONS.has(stepAction) && stepAction !== 'evaluate') {
+        throw new BrowserToolError('UNSUPPORTED_ACTION', `Unsupported batch action in step ${index + 1}: "${stepAction}".`, { step: index + 1, action: stepAction });
+      }
+    });
+    if (request.observeAfter !== undefined && !['none', 'delta', 'full'].includes(request.observeAfter)) {
+      throw new BrowserToolError('INVALID_BATCH', 'batch observeAfter must be none, delta, or full.');
+    }
+  }
+  if (operation === 'tabs') {
+    const tabAction = request.action || 'list';
+    if (!['list', 'switch', 'close'].includes(tabAction)) throw new BrowserToolError('INVALID_TAB_ACTION', 'tabs action must be list, switch, or close.');
+    if (['switch', 'close'].includes(tabAction)) {
+      const index = Number(request.index);
+      if (!Number.isInteger(index) || index < 0) throw new BrowserToolError('INVALID_TAB_INDEX', `tabs ${tabAction} requires a non-negative integer index.`);
+    }
   }
   if (operation === 'subscribe') {
     normalizeEventList(request.events);
@@ -499,12 +509,16 @@ function getCapabilities() {
     agentActions: [...AGENT_ACTIONS],
     workflowActions: [...WORKFLOW_ACTIONS],
     observeModes: ['full', 'delta'],
+    observeViews: ['standard', 'controls'],
+    optionalSessionActions: ['evaluate (requires the session to be opened with allowEvaluate: true)'],
     eventNames: [...SESSION_EVENT_NAMES],
     safetyModes: [...SAFETY_MODES],
     features: [
       'request-ids', 'structured-errors', 'bounded-output', 'semantic-locator-fallbacks',
       'diagnostic-filters', 'delta-observations', 'event-subscriptions', 'dom-watchers',
-      'workflow-validation', 'safe-mode'
+      'workflow-validation', 'safe-mode', 'session-discovery', 'ref-recovery',
+      'batch-operations', 'observation-views', 'tab-management', 'opt-in-session-evaluate',
+      'idempotent-close'
     ],
     defaultLimits: {
       maxItems: DEFAULT_AGENT_ITEM_LIMIT,
@@ -523,7 +537,8 @@ function getCapabilities() {
       maxSessionSubscriptions: MAX_SESSION_SUBSCRIPTIONS,
       maxSessionWatchers: MAX_SESSION_WATCHERS,
       maxWatchTimeout: MAX_WATCH_TIMEOUT,
-      maxViewportDimension: MAX_VIEWPORT_DIMENSION
+      maxViewportDimension: MAX_VIEWPORT_DIMENSION,
+      maxBatchSteps: MAX_BATCH_STEPS
     }
   };
 }
@@ -986,8 +1001,9 @@ async function collectAgentSnapshot(page, options = {}) {
   const textLimit = Math.max(100, Math.min(Number(options.maxText) || DEFAULT_AGENT_TEXT_LIMIT, 4000));
   const includeGeometry = Boolean(options.includeGeometry);
   const redact = Boolean(options.redact);
+  const view = options.view === 'controls' ? 'controls' : 'standard';
 
-  const snapshot = await page.evaluate(({ itemLimit: limit, textLimit: textMax, includeGeometry: withGeometry, redact: withRedaction }) => {
+  const snapshot = await page.evaluate(({ itemLimit: limit, textLimit: textMax, includeGeometry: withGeometry, redact: withRedaction, view: viewMode }) => {
     const normalize = (value, max = textMax) => (value || '').replace(/\s+/g, ' ').trim().slice(0, max);
     const sensitive = (element) => element.matches('input[type="password"], [data-sensitive], .sensitive-data')
       || Boolean(element.closest('[data-sensitive], .sensitive-data'));
@@ -1025,6 +1041,13 @@ async function collectAgentSnapshot(page, options = {}) {
       }
       const wrappingLabel = element.closest('label');
       if (wrappingLabel) return normalize(wrappingLabel.textContent, 120);
+      // HTML accessible-name spec: submit/button/reset inputs are named by
+      // their value attribute. Matching Playwright's getByRole naming here
+      // keeps snapshot identities aligned with semantic re-resolution.
+      const inputType = (element.getAttribute('type') || '').toLowerCase();
+      if (element.tagName === 'INPUT' && ['submit', 'button', 'reset'].includes(inputType)) {
+        return normalize(element.getAttribute('value') || element.value || element.id || '', 120);
+      }
       return normalize(element.getAttribute('placeholder') || element.textContent || element.getAttribute('alt') || element.getAttribute('name') || element.id || '', 120);
     };
     const roleFor = (element) => {
@@ -1060,13 +1083,30 @@ async function collectAgentSnapshot(page, options = {}) {
 
     const selector = 'button, a[href], input:not([type="hidden"]), textarea, select, summary, iframe, canvas, [role], [contenteditable="true"]';
     const candidates = Array.from(document.querySelectorAll(selector)).filter(visible);
-    const elements = candidates.slice(0, limit).map((element, index) => {
-      const rect = element.getBoundingClientRect();
+    // Single pass for semantic disambiguation. Roles and names are computed
+    // once per element; the running map tracks occurrences so each element
+    // gets its nth index and the total count for its role+name identity. The
+    // identity count lets ref recovery detect ambiguity after a re-render.
+    const limited = candidates.slice(0, limit);
+    const roles = [];
+    const names = [];
+    const semanticKeys = [];
+    for (const element of limited) {
       const role = roleFor(element);
       const name = accessibleName(element);
-      const sameSemanticIndex = candidates.slice(0, index).filter(candidate => (
-        roleFor(candidate) === role && accessibleName(candidate) === name
-      )).length;
+      roles.push(role);
+      names.push(name);
+      semanticKeys.push(`${role}\u0000${name}`);
+    }
+    const semanticTotals = new Map();
+    for (const key of semanticKeys) semanticTotals.set(key, (semanticTotals.get(key) || 0) + 1);
+    const semanticProgress = new Map();
+    const elements = limited.map((element, index) => {
+      const rect = element.getBoundingClientRect();
+      const role = roles[index];
+      const name = names[index];
+      const sameSemanticIndex = semanticProgress.get(semanticKeys[index]) || 0;
+      semanticProgress.set(semanticKeys[index], sameSemanticIndex + 1);
       const item = {
         ref: `e${index + 1}`,
         tag: element.tagName.toLowerCase(),
@@ -1077,18 +1117,23 @@ async function collectAgentSnapshot(page, options = {}) {
         locator: {
           role,
           ...(name ? { name } : {}),
-          nth: sameSemanticIndex
+          nth: sameSemanticIndex,
+          count: semanticTotals.get(semanticKeys[index]),
+          // Identity fingerprint: when the element has an id, recovery verifies
+          // the re-matched element still carries it, so a same-name element
+          // with a different identity can never be acted on silently.
+          ...(element.id ? { fid: `${element.tagName.toLowerCase()}#${element.id}` } : {})
         }
       };
       if (withGeometry) item.rect = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
       return item;
     });
 
-    const headings = Array.from(document.querySelectorAll('h1, h2, h3')).filter(visible).slice(0, 15).map(heading => ({
+    const headings = viewMode === 'controls' ? [] : Array.from(document.querySelectorAll('h1, h2, h3')).filter(visible).slice(0, 15).map(heading => ({
       level: heading.tagName.toLowerCase(),
       text: withRedaction && sensitive(heading) ? '[redacted]' : normalize(heading.textContent, 180)
     }));
-    const landmarks = Array.from(document.querySelectorAll('main, nav, aside, header, footer, dialog, form')).filter(visible).slice(0, 12).map(element => ({
+    const landmarks = viewMode === 'controls' ? [] : Array.from(document.querySelectorAll('main, nav, aside, header, footer, dialog, form')).filter(visible).slice(0, 12).map(element => ({
       role: element.getAttribute('role') || element.tagName.toLowerCase(),
       name: accessibleName(element)
     }));
@@ -1096,9 +1141,10 @@ async function collectAgentSnapshot(page, options = {}) {
     return {
       title: document.title,
       url: location.href,
+      view: viewMode,
       headings,
       landmarks,
-      text: (() => {
+      text: viewMode === 'controls' ? '' : (() => {
         if (!withRedaction || !document.body) return normalize(document.body?.innerText, textMax);
         const clone = document.body.cloneNode(true);
         clone.querySelectorAll('input[type="password"], [data-sensitive], .sensitive-data').forEach(element => {
@@ -1111,7 +1157,7 @@ async function collectAgentSnapshot(page, options = {}) {
       truncated: candidates.length > limit,
       elements
     };
-  }, { itemLimit, textLimit, includeGeometry, redact });
+  }, { itemLimit, textLimit, includeGeometry, redact, view });
 
   const refs = new Map(snapshot.elements.map(element => [element.ref, {
     selector: element.selector,
@@ -1173,6 +1219,11 @@ function normalizeSessionIdleTimeout(value) {
 
 async function disposeAgentSession(session) {
   activeAgentSessions.delete(session.id);
+  recentlyDisposedSessions.set(session.id, Date.now());
+  if (recentlyDisposedSessions.size > 200) {
+    const oldest = recentlyDisposedSessions.keys().next().value;
+    recentlyDisposedSessions.delete(oldest);
+  }
   for (const watcher of session.watchers.values()) {
     watcher.active = false;
     await cancelPageWatch(watcher.page, watcher.id);
@@ -1372,6 +1423,19 @@ export async function unwatchAgentSession(options = {}) {
   return { sessionId: session.id, watcherId, status: 'unwatched' };
 }
 
+// Coalesce consecutive identical diagnostics so a page that logs the same
+// error 50 times costs one bounded entry (with a count) instead of 50
+// entries. Evidence is preserved; only repetition is collapsed.
+function appendDiagnosticCoalesced(collection, diagnostic, matchKeys) {
+  const last = collection[collection.length - 1];
+  if (last && matchKeys.every(key => last[key] === diagnostic[key])) {
+    last.count = (last.count || 1) + 1;
+    if (collection.length > MAX_SESSION_DIAGNOSTICS) collection.splice(0, collection.length - MAX_SESSION_DIAGNOSTICS);
+    return;
+  }
+  appendBounded(collection, { ...diagnostic, count: 1 });
+}
+
 function attachSessionDiagnostics(session, page) {
   if (session.instrumentedPages.has(page)) return;
   session.instrumentedPages.add(page);
@@ -1392,24 +1456,24 @@ function attachSessionDiagnostics(session, page) {
     if (shouldIgnoreUrl(page.url(), session.ignoreUrls)) return;
     const diagnostic = { type: message.type(), text: redactSensitiveText(message.text()).slice(0, 300), url: sanitizeUrl(page.url()) };
     if (message.type() === 'error') {
-      appendBounded(session.consoleErrors, diagnostic);
+      appendDiagnosticCoalesced(session.consoleErrors, diagnostic, ['type', 'text', 'url']);
       emitSessionEvent(session, 'console.error', diagnostic);
     } else if (isConsoleWarningType(message.type())) {
-      appendBounded(session.consoleWarnings, diagnostic);
+      appendDiagnosticCoalesced(session.consoleWarnings, diagnostic, ['type', 'text', 'url']);
       emitSessionEvent(session, 'console.warning', diagnostic);
     }
   });
   page.on('pageerror', error => {
     if (shouldIgnoreUrl(page.url(), session.ignoreUrls)) return;
     const diagnostic = { type: 'uncaught-error', text: redactSensitiveText(error.message).slice(0, 300), url: sanitizeUrl(page.url()) };
-    appendBounded(session.consoleErrors, diagnostic);
+    appendDiagnosticCoalesced(session.consoleErrors, diagnostic, ['type', 'text', 'url']);
     emitSessionEvent(session, 'console.error', diagnostic);
   });
   page.on('response', response => {
     if (shouldIgnoreUrl(response.url(), session.ignoreUrls)) return;
     if (response.status() >= 400) {
       const diagnostic = { method: response.request().method(), status: response.status(), url: sanitizeUrl(response.url()) };
-      appendBounded(session.networkErrors, diagnostic);
+      appendDiagnosticCoalesced(session.networkErrors, diagnostic, ['method', 'status', 'url']);
       emitSessionEvent(session, 'network.error', diagnostic);
     }
   });
@@ -1420,7 +1484,7 @@ function attachSessionDiagnostics(session, page) {
       url: sanitizeUrl(request.url()),
       failure: redactSensitiveText(request.failure()?.errorText || 'request failed').slice(0, 300)
     };
-    appendBounded(session.requestFailures, diagnostic);
+    appendDiagnosticCoalesced(session.requestFailures, diagnostic, ['method', 'url', 'failure']);
     emitSessionEvent(session, 'request.failed', diagnostic);
   });
   page.on('crash', () => emitSessionEvent(session, 'page.crash', { url: sanitizeUrl(page.url()) }));
@@ -1454,24 +1518,80 @@ function getAgentSession(sessionId) {
   return session;
 }
 
-async function resolveAgentRef(page, reference) {
-  let cssLocator = null;
+async function resolveAgentRef(page, reference, options = {}) {
+  // Bounded re-check window. The original implementation returned a locator it
+  // had already proven was dead (count === 0), so the action then burned the
+  // full action timeout (8s default) before failing with a generic
+  // TimeoutError. We instead wait briefly for re-attachment and, when the ref
+  // is truly stale, fail fast with a machine-readable STALE_REF error that
+  // carries the evidence an agent needs to recover (re-observe).
+  const refWaitMs = Number.isFinite(Number(options.refWaitMs)) ? Math.max(0, Number(options.refWaitMs)) : 1000;
+  const candidates = [];
   if (reference?.selector) {
-    try {
-      cssLocator = page.locator(reference.selector).first();
-      if (await cssLocator.count() > 0) return cssLocator;
-    } catch {}
+    const selector = reference.selector;
+    candidates.push({
+      describe: `selector "${selector}"`,
+      build: () => page.locator(selector).first()
+    });
   }
-
   const semantic = reference?.locator;
   if (semantic?.role) {
-    try {
-      const roleOptions = semantic.name ? { name: semantic.name, exact: true } : {};
-      const semanticLocator = page.getByRole(semantic.role, roleOptions).nth(Number(semantic.nth) || 0);
-      if (await semanticLocator.count() > 0) return semanticLocator;
-    } catch {}
+    const role = semantic.role;
+    const nth = Number(semantic.nth) || 0;
+    const roleOptions = semantic.name ? { name: semantic.name, exact: true } : {};
+    candidates.push({
+      describe: `role=${role}${semantic.name ? ` name="${semantic.name}"` : ''} nth=${nth}`,
+      build: () => page.getByRole(role, roleOptions).nth(nth)
+    });
   }
-  return cssLocator;
+
+  const tried = [];
+  for (const candidate of candidates) {
+    try {
+      const locator = candidate.build();
+      await locator.waitFor({ state: 'attached', timeout: refWaitMs });
+      return locator;
+    } catch (error) {
+      tried.push({
+        target: candidate.describe,
+        resolved: false,
+        reason: error?.name === 'TimeoutError' ? `not attached within ${refWaitMs}ms` : errorMessage(error)
+      });
+    }
+  }
+
+  throw new BrowserToolError('STALE_REF', 'Referenced element is no longer attached. Observe again to refresh refs.', {
+    tried,
+    hint: 'Refs are invalidated after every act. Send observe (mode "delta" is cheaper), then act using a ref from the fresh observation.'
+  });
+}
+
+// Attempt a semantic re-match of a stale ref using the identity recorded at
+// observation time (role + name + nth + identity count). Recovery only
+// succeeds when the semantic group size is unchanged, so a re-render that
+// added or removed sibling controls can never silently redirect the action.
+// Returns the locator or null; never throws.
+async function recoverAgentRef(page, identity, options = {}) {
+  const semantic = identity?.locator;
+  if (!semantic?.role) return null;
+  const refWaitMs = Number.isFinite(Number(options.refWaitMs)) ? Math.max(0, Number(options.refWaitMs)) : 1000;
+  try {
+    const roleOptions = semantic.name ? { name: semantic.name, exact: true } : {};
+    const matches = page.getByRole(semantic.role, roleOptions);
+    const currentCount = await matches.count();
+    if (semantic.count !== undefined && currentCount !== semantic.count) return null;
+    const nth = Number(semantic.nth) || 0;
+    if (currentCount < nth + 1) return null;
+    const locator = matches.nth(nth);
+    await locator.waitFor({ state: 'attached', timeout: refWaitMs });
+    if (semantic.fid) {
+      const fingerprint = await locator.evaluate(el => `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ''}`).catch(() => null);
+      if (fingerprint !== semantic.fid) return null;
+    }
+    return locator;
+  } catch {
+    return null;
+  }
 }
 
 export async function observeAgentSession(options = {}) {
@@ -1480,6 +1600,7 @@ export async function observeAgentSession(options = {}) {
   if (!page || page.isClosed()) throw new Error(`Agent session has no open page: ${session.id}`);
   const mode = options.mode || 'full';
   if (mode !== 'full' && mode !== 'delta') throw new BrowserToolError('INVALID_OBSERVE_MODE', 'observe mode must be full or delta.');
+  if (options.view !== undefined && !['standard', 'controls'].includes(options.view)) throw new BrowserToolError('INVALID_OBSERVE_VIEW', 'observe view must be standard or controls.');
   let requestedSince = null;
   if (options.since !== undefined) {
     requestedSince = Number(options.since);
@@ -1496,6 +1617,11 @@ export async function observeAgentSession(options = {}) {
     redact: session.redact
   });
   session.refs = snapshot.refs;
+  // refHistory keeps the semantic identity of the most recent observation's
+  // refs alive after act clears session.refs, so stale-ref recovery (R1) can
+  // re-match an element by role+name+nth+count instead of forcing a full
+  // observe round trip. Cleared whenever the active page changes.
+  session.refHistory = new Map(snapshot.refs);
   session.generation += 1;
   session.lastSnapshot = snapshot;
   session.lastSnapshotGeneration = session.generation;
@@ -1584,8 +1710,6 @@ export async function createAgentSession(options = {}) {
     token: options.token || null,
     cookie: options.cookie || null,
     network: options.network || null,
-    chaos: Boolean(options.chaos),
-    chaosSeed: options.chaosSeed ?? null,
     safetyMode,
     allowedHosts,
     ignoreUrls,
@@ -1612,6 +1736,9 @@ export async function createAgentSession(options = {}) {
     origin: url,
     authOrigin: url,
     refs: new Map(),
+    refHistory: new Map(),
+    autoRecoverRefs: options.autoRecoverRefs === false ? false : true,
+    allowEvaluate: Boolean(options.allowEvaluate),
     generation: 0,
     instrumentedPages: new WeakSet(),
     consoleErrors: [],
@@ -1623,16 +1750,22 @@ export async function createAgentSession(options = {}) {
 
   attachSessionDiagnostics(session, page);
   context.on('page', newPage => {
+    const previousPage = session.page;
     session.page = newPage;
     session.refs.clear();
+    session.refHistory.clear();
     attachSessionDiagnostics(session, newPage);
+    emitSessionEvent(session, 'page.opened', {
+      url: sanitizeUrl(newPage.url()),
+      tabIndex: context.pages().indexOf(newPage),
+      activePageSwitched: true,
+      previousUrl: previousPage ? sanitizeUrl(previousPage.url()) : null
+    });
     void configureContextFeatures(context, newPage, {
       network: session.network,
       redact: session.redact,
       token: session.token,
       cookie: session.cookie,
-      chaos: session.chaos,
-      chaosSeed: session.chaosSeed,
       url: session.authOrigin
     }).catch(err => {
       appendBounded(session.consoleErrors, { type: 'browser-tool-error', text: errorMessage(err), url: sanitizeUrl(newPage.url()) });
@@ -1645,8 +1778,6 @@ export async function createAgentSession(options = {}) {
       redact: session.redact,
       token: session.token,
       cookie: session.cookie,
-      chaos: session.chaos,
-      chaosSeed: session.chaosSeed,
       url: session.authOrigin
     });
     await page.goto(url, { waitUntil: session.waitUntil, timeout: options.timeout || 35000 });
@@ -1656,11 +1787,28 @@ export async function createAgentSession(options = {}) {
       readyTimeout: session.readyTimeout,
       delay: session.delay
     });
-    return await observeAgentSession({ sessionId, maxItems: options.maxItems, maxText: options.maxText });
+    return await observeAgentSession({ sessionId, maxItems: options.maxItems, maxText: options.maxText, view: options.view });
   } catch (err) {
     await closeAgentSession({ sessionId }).catch(() => {});
     throw err;
   }
+}
+
+// Post-hoc transparency: describes the element an act actually resolved to,
+// so the agent can verify it hit the intended target.
+function describeActedOn(ref, identity, selector) {
+  if (identity) {
+    return {
+      ...(ref ? { ref } : {}),
+      ...(identity.selector ? { selector: identity.selector } : {}),
+      ...(identity.locator ? {
+        role: identity.locator.role,
+        ...(identity.locator.name ? { name: identity.locator.name } : {}),
+        nth: identity.locator.nth
+      } : {})
+    };
+  }
+  return selector ? { selector } : null;
 }
 
 export async function actAgentSession(options = {}) {
@@ -1668,16 +1816,48 @@ export async function actAgentSession(options = {}) {
   const page = session.page;
   if (!page || page.isClosed()) throw new Error(`Agent session has no open page: ${session.id}`);
   const action = requireString(options.action, 'INVALID_ACTION', 'act action');
-  if (!AGENT_ACTIONS.has(action)) throw new BrowserToolError('UNSUPPORTED_ACTION', `Unsupported agent action: "${action}".`, { action });
+  const allowedActions = session.allowEvaluate ? new Set([...AGENT_ACTIONS, 'evaluate']) : AGENT_ACTIONS;
+  if (!allowedActions.has(action)) {
+    const hint = action === 'evaluate' && !session.allowEvaluate
+      ? ' evaluate requires the session to be opened with allowEvaluate: true.'
+      : '';
+    throw new BrowserToolError('UNSUPPORTED_ACTION', `Unsupported agent action: "${action}".${hint}`, { action });
+  }
   if (['click', 'fill', 'type', 'check', 'uncheck', 'select', 'selectOption', 'hover', 'assert'].includes(action)
     && !options.ref && !options.selector) throw new BrowserToolError('MISSING_TARGET', `${action} requires ref or selector.`);
   const timeout = Number(options.timeout) || DEFAULT_ACTION_TIMEOUT;
   const reference = options.ref ? session.refs.get(options.ref) : null;
-  if (options.ref && !reference) throw new BrowserToolError('STALE_REF', `Unknown or stale element ref: ${options.ref}. Observe again.`);
-  const target = reference
-    ? await resolveAgentRef(page, reference)
-    : options.selector ? page.locator(options.selector).first() : null;
-  if (options.ref && !target) throw new BrowserToolError('STALE_REF', `Element ref ${options.ref} is no longer present. Observe again.`);
+  let target = null;
+  let refRecovered = null;
+  let actedOn = null;
+  if (options.ref && !reference) {
+    // Refs were invalidated (e.g. by a previous act). Try semantic recovery
+    // from the recorded identity before failing; recovery is count-guarded so
+    // it can never resolve to a different element than the one observed.
+    const identity = session.refHistory.get(options.ref) || null;
+    if (options.recoverRef === false || !session.autoRecoverRefs || !identity) {
+      throw new BrowserToolError('STALE_REF', `Unknown or stale element ref: ${options.ref}. Observe again.`);
+    }
+    const recovered = await recoverAgentRef(page, identity, { refWaitMs: options.refWaitMs });
+    if (!recovered) throw new BrowserToolError('STALE_REF', `Unknown or stale element ref: ${options.ref}. Observe again.`);
+    target = recovered;
+    refRecovered = { ref: options.ref, locator: { role: identity.locator.role, ...(identity.locator.name ? { name: identity.locator.name } : {}), nth: identity.locator.nth } };
+    actedOn = describeActedOn(options.ref, identity, null);
+  } else if (reference) {
+    try {
+      target = await resolveAgentRef(page, reference, { refWaitMs: options.refWaitMs });
+    } catch (staleError) {
+      if (options.recoverRef === false || !session.autoRecoverRefs) throw staleError;
+      const recovered = await recoverAgentRef(page, reference, { refWaitMs: options.refWaitMs });
+      if (!recovered) throw staleError;
+      target = recovered;
+      refRecovered = { ref: options.ref, locator: { role: reference.locator.role, ...(reference.locator.name ? { name: reference.locator.name } : {}), nth: reference.locator.nth } };
+    }
+    actedOn = describeActedOn(options.ref, reference, null);
+  } else {
+    target = options.selector ? page.locator(options.selector).first() : null;
+    actedOn = describeActedOn(null, null, options.selector);
+  }
   let actionResult = null;
   let dialogAttempt = null;
   if (session.pendingDialog && action !== 'dialog') {
@@ -1799,6 +1979,18 @@ export async function actAgentSession(options = {}) {
       actionResult = { screenshotPath: outputPath };
       break;
     }
+    case 'evaluate': {
+      if (session.safetyMode === 'safe') throw new BrowserToolError('UNSAFE_ACTION', 'evaluate is disabled in safetyMode=safe.');
+      const evaluationFn = typeof options.fn === 'string' ? options.fn : null;
+      const evaluationScript = typeof options.script === 'string' ? options.script : null;
+      if (!evaluationFn && !evaluationScript) throw new Error('evaluate requires fn or script.');
+      const evaluated = await page.evaluate(payload => {
+        if (payload.fn) return Function(`return (${payload.fn})`)()(payload.arg);
+        return Function(payload.script)(payload.arg);
+      }, { fn: evaluationFn, script: evaluationScript, arg: options.arg ?? null });
+      actionResult = { result: compactValue(evaluated) };
+      break;
+    }
     default:
       throw new Error(`Unsupported agent action: ${action}`);
     }
@@ -1817,6 +2009,8 @@ export async function actAgentSession(options = {}) {
     title: await page.title().catch(() => ''),
     generation: session.generation,
     requiresObserve: true,
+    ...(refRecovered ? { refRecovered } : {}),
+    ...(actedOn ? { actedOn } : {}),
     ...actionResult,
     diagnostics: takeSessionDiagnostics(session)
   };
@@ -1825,9 +2019,165 @@ export async function actAgentSession(options = {}) {
 }
 
 export async function closeAgentSession(options = {}) {
-  const session = getAgentSession(options.sessionId);
+  const session = activeAgentSessions.get(options.sessionId);
+  if (!session) {
+    // Idempotent cleanup: an agent that already saw SESSION_EXPIRED (or closed
+    // the session twice) should not fail its own cleanup step. Never-existing
+    // session ids still error so typos stay diagnosable.
+    const requestedId = options.sessionId === undefined || options.sessionId === null ? '' : String(options.sessionId);
+    if (requestedId && recentlyDisposedSessions.has(requestedId)) {
+      return { sessionId: requestedId, status: 'closed', alreadyClosed: true };
+    }
+    throw new BrowserToolError('SESSION_NOT_FOUND', `Unknown agent session: ${options.sessionId}`);
+  }
   await disposeAgentSession(session);
   return { sessionId: session.id, status: 'closed' };
+}
+
+// Session discovery. After a crash or reconnect, an agent had no way to learn
+// which sessions still exist; it could only discover them by triggering
+// SESSION_EXISTS / SESSION_NOT_FOUND errors. This is additive and read-only.
+export function listAgentSessions() {
+  const now = Date.now();
+  return Array.from(activeAgentSessions.values()).map(session => ({
+    sessionId: session.id,
+    url: sanitizeUrl(session.page && !session.page.isClosed() ? session.page.url() : session.origin),
+    channelUsed: session.channelUsed,
+    safetyMode: session.safetyMode,
+    generation: session.generation,
+    idleTimeoutMs: session.idleTimeoutMs,
+    msSinceLastActivity: now - session.lastActivityAt,
+    expiresInMillis: session.idleTimeoutMs > 0 ? Math.max(0, session.idleTimeoutMs - (now - session.lastActivityAt)) : null,
+    subscriptions: session.subscriptions.size,
+    watchers: session.watchers.size
+  }));
+}
+
+// Batch execution of several act actions in one round trip (R3). Steps run
+// sequentially on the session's active page; refs recorded by the last
+// observation stay usable for the first step (and later steps when ref
+// recovery succeeds), but selectors are the reliable way to address elements
+// across steps because refs are invalidated after every act. Default behavior
+// is stop-on-first-error with per-step evidence, so the agent always knows
+// exactly which step failed and why.
+export async function batchAgentSession(options = {}) {
+  const session = getAgentSession(options.sessionId);
+  const steps = options.steps;
+  if (!Array.isArray(steps) || steps.length === 0) throw new BrowserToolError('INVALID_BATCH', 'batch steps must be a non-empty array.');
+  if (steps.length > MAX_BATCH_STEPS) throw new BrowserToolError('BATCH_TOO_LARGE', `batch cannot contain more than ${MAX_BATCH_STEPS} steps.`);
+  const stopOnError = options.stopOnError !== false;
+  const observeAfter = ['none', 'delta', 'full'].includes(options.observeAfter) ? options.observeAfter : 'none';
+  const mergedDiagnostics = { consoleErrors: [], consoleWarnings: [], networkErrors: [], requestFailures: [] };
+  const stepResults = [];
+  let failedStep = null;
+  let passedSteps = 0;
+
+  for (let index = 0; index < steps.length; index++) {
+    const step = steps[index];
+    if (!step || typeof step !== 'object' || Array.isArray(step)) {
+      throw new BrowserToolError('INVALID_BATCH_STEP', `batch step ${index + 1} must be a JSON object.`);
+    }
+    try {
+      const actResult = await actAgentSession({ ...step, sessionId: session.id, refWaitMs: options.refWaitMs });
+      passedSteps += 1;
+      const { diagnostics, ...actBody } = actResult;
+      for (const key of Object.keys(mergedDiagnostics)) {
+        mergedDiagnostics[key].push(...(diagnostics?.[key] || []));
+        if (mergedDiagnostics[key].length > MAX_SESSION_DIAGNOSTICS) mergedDiagnostics[key].splice(0, mergedDiagnostics[key].length - MAX_SESSION_DIAGNOSTICS);
+      }
+      const entry = { index, action: actBody.action, status: 'ok', url: actBody.url, title: actBody.title, generation: actBody.generation };
+      for (const key of ['downloadPath', 'screenshotPath', 'permissions', 'permissionOrigin', 'result']) {
+        if (actBody[key] !== undefined) entry[key] = actBody[key];
+      }
+      if (actBody.refRecovered) entry.refRecovered = actBody.refRecovered;
+      stepResults.push(entry);
+    } catch (error) {
+      failedStep = index;
+      stepResults.push({
+        index,
+        action: step.action,
+        status: 'error',
+        code: errorCode(error),
+        error: errorMessage(error)
+      });
+      if (stopOnError) break;
+    }
+  }
+
+  const result = {
+    sessionId: session.id,
+    op: 'batch',
+    status: failedStep === null ? 'ok' : (passedSteps > 0 ? 'partial' : 'error'),
+    safetyMode: session.safetyMode,
+    totalSteps: steps.length,
+    passedSteps,
+    ...(failedStep !== null ? { failedStep } : {}),
+    url: sanitizeUrl(session.page && !session.page.isClosed() ? session.page.url() : ''),
+    title: await session.page?.title().catch(() => '') || '',
+    generation: session.generation,
+    requiresObserve: true,
+    steps: stepResults,
+    diagnostics: {
+      consoleErrors: mergedDiagnostics.consoleErrors.length > 0 ? mergedDiagnostics.consoleErrors : undefined,
+      consoleWarnings: mergedDiagnostics.consoleWarnings.length > 0 ? mergedDiagnostics.consoleWarnings : undefined,
+      networkErrors: mergedDiagnostics.networkErrors.length > 0 ? mergedDiagnostics.networkErrors : undefined,
+      requestFailures: mergedDiagnostics.requestFailures.length > 0 ? mergedDiagnostics.requestFailures : undefined
+    }
+  };
+  if (observeAfter !== 'none') {
+    result.observation = await observeAgentSession({ sessionId: session.id, mode: observeAfter === 'delta' ? 'delta' : 'full' });
+  }
+  return result;
+}
+
+// Tab management for sessions (R6). Pages opened by the site (popups,
+// window.open) already become the active page; this operation makes that
+// visible and controllable instead of surprising.
+export async function tabsAgentSession(options = {}) {
+  const session = getAgentSession(options.sessionId);
+  const pages = session.context.pages();
+  const tabAction = options.action || 'list';
+
+  if (tabAction === 'list') {
+    const activeIndex = pages.indexOf(session.page);
+    return {
+      sessionId: session.id,
+      action: 'list',
+      activeIndex,
+      tabs: pages.map((page, index) => ({ index, url: sanitizeUrl(page.url()), active: page === session.page }))
+    };
+  }
+
+  const index = Number(options.index);
+  if (!Number.isInteger(index) || index < 0 || index >= pages.length) {
+    throw new BrowserToolError('INVALID_TAB_INDEX', `tab index must be an integer from 0 to ${pages.length - 1}.`);
+  }
+
+  if (tabAction === 'switch') {
+    const previousPage = session.page;
+    session.page = pages[index];
+    if (session.page !== previousPage) {
+      session.refs.clear();
+      session.refHistory.clear();
+      session.generation += 1;
+      attachSessionDiagnostics(session, session.page);
+    }
+    return {
+      sessionId: session.id,
+      action: 'switch',
+      switchedTo: index,
+      url: sanitizeUrl(session.page.url()),
+      generation: session.generation,
+      requiresObserve: true
+    };
+  }
+
+  // close
+  if (pages[index] === session.page) {
+    throw new BrowserToolError('INVALID_TAB_ACTION', 'cannot close the active tab; switch to another tab first.');
+  }
+  await pages[index].close().catch(() => {});
+  return { sessionId: session.id, action: 'close', closedIndex: index, remainingTabs: session.context.pages().length };
 }
 
 export async function serveAgentSessions(defaultOptions = {}) {
@@ -1865,6 +2215,15 @@ export async function serveAgentSessions(defaultOptions = {}) {
           output({ requestId, ok: true, ...getCapabilities() }, requestOutputLimit);
           continue;
         }
+        if (operation === 'sessions') {
+          output({
+            requestId,
+            ok: true,
+            activeSessions: activeAgentSessions.size,
+            sessions: listAgentSessions()
+          }, requestOutputLimit);
+          continue;
+        }
         if (operation === 'quit' || operation === 'exit') {
           for (const session of Array.from(activeAgentSessions.values())) await disposeAgentSession(session);
           output({ requestId, ok: true, status: 'stopped' }, requestOutputLimit);
@@ -1886,6 +2245,8 @@ export async function serveAgentSessions(defaultOptions = {}) {
         }
         else if (operation === 'observe') result = await observeAgentSession(request);
         else if (operation === 'act') result = await actAgentSession(request);
+        else if (operation === 'batch') result = await batchAgentSession(request);
+        else if (operation === 'tabs') result = await tabsAgentSession(request);
         else if (operation === 'subscribe') result = subscribeAgentSession(request);
         else if (operation === 'unsubscribe') result = unsubscribeAgentSession(request);
         else if (operation === 'watch') result = await watchAgentSession(request);
@@ -1918,7 +2279,7 @@ export async function serveAgentSessions(defaultOptions = {}) {
 // 3. MOBILE OVERFLOW & LAYOUT BUG HUNTER (layout)
 // ==========================================
 export async function huntLayoutBugs(options) {
-  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, channel = null, executablePath = null, waitUntil = 'domcontentloaded', viewport = { width: 390, height: 844 }, authStatePath = null, token = null, cookie = null, network = null, chaos = false, chaosSeed = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, tapTargetMinimum = 28 } = options;
+  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, channel = null, executablePath = null, waitUntil = 'domcontentloaded', viewport = { width: 390, height: 844 }, authStatePath = null, token = null, cookie = null, network = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, tapTargetMinimum = 28 } = options;
   if (!url) throw new Error('URL is required.');
   const targetUrl = resolveWorkflowUrl(url);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
@@ -1939,7 +2300,7 @@ export async function huntLayoutBugs(options) {
     if (timezone) contextOptions.timezoneId = timezone;
     context = await browser.newContext(contextOptions);
     const page = await context.newPage();
-    await configureContextFeatures(context, page, { network, token, cookie, chaos, chaosSeed, redact, url: targetUrl });
+    await configureContextFeatures(context, page, { network, token, cookie, redact, url: targetUrl });
     await page.goto(targetUrl, { waitUntil, timeout: 35000 });
     assertFinalNavigationAllowed(page, targetUrl, normalizedSafetyMode, normalizedAllowedHosts);
     await waitForReadiness(page, { readySelector, readyTimeout, delay });
@@ -2006,7 +2367,7 @@ export async function huntLayoutBugs(options) {
 // 4. BOUNDED INTERACTIVE MAP (map)
 // ==========================================
 export async function mapInteractiveElements(options) {
-  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, channel = null, executablePath = null, authStatePath = null, waitUntil = 'domcontentloaded', token = null, cookie = null, network = null, chaos = false, chaosSeed = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], maxItems = DEFAULT_AGENT_ITEM_LIMIT, maxText = DEFAULT_AGENT_TEXT_LIMIT, readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0 } = options;
+  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, channel = null, executablePath = null, authStatePath = null, waitUntil = 'domcontentloaded', token = null, cookie = null, network = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], maxItems = DEFAULT_AGENT_ITEM_LIMIT, maxText = DEFAULT_AGENT_TEXT_LIMIT, readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0 } = options;
   if (!url) throw new Error('URL is required.');
   const targetUrl = resolveWorkflowUrl(url);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
@@ -2027,7 +2388,7 @@ export async function mapInteractiveElements(options) {
 
     context = await browser.newContext(contextOptions);
     const page = await context.newPage();
-    await configureContextFeatures(context, page, { network, redact, token, cookie, chaos, chaosSeed, url: targetUrl });
+    await configureContextFeatures(context, page, { network, redact, token, cookie, url: targetUrl });
     await page.goto(targetUrl, { waitUntil, timeout: 35000 });
     assertFinalNavigationAllowed(page, targetUrl, normalizedSafetyMode, normalizedAllowedHosts);
     if (redact) await applyRedaction(page);
@@ -2118,8 +2479,6 @@ export async function captureResponsiveScreenshots(options) {
     waitUntil = 'domcontentloaded',
     token = null,
     cookie = null,
-    chaos = false,
-    chaosSeed = null,
     geo = null,
     timezone = null,
     freezeAnimations = true,
@@ -2201,7 +2560,7 @@ export async function captureResponsiveScreenshots(options) {
     const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
     try {
-      await configureContextFeatures(context, page, { network, redact, token, cookie, chaos, chaosSeed, url: targetUrl });
+      await configureContextFeatures(context, page, { network, redact, token, cookie, url: targetUrl });
       await page.goto(targetUrl, { waitUntil, timeout: 35000 });
       assertFinalNavigationAllowed(page, targetUrl, normalizedSafetyMode, normalizedAllowedHosts);
       if (redact) await applyRedaction(page);
@@ -2296,8 +2655,6 @@ export async function probeUrl(options) {
     waitUntil = 'domcontentloaded',
     token = null,
     cookie = null,
-    chaos = false,
-    chaosSeed = null,
     geo = null,
     timezone = null,
     hover = null,
@@ -2356,7 +2713,7 @@ export async function probeUrl(options) {
 
     context = await browser.newContext(contextOptions);
     const page = await context.newPage();
-    await configureContextFeatures(context, page, { network, redact, token, cookie, chaos, chaosSeed, url: targetUrl });
+    await configureContextFeatures(context, page, { network, redact, token, cookie, url: targetUrl });
 
     page.on('console', (msg) => {
       if (shouldIgnoreUrl(page.url(), ignoredUrls)) return;
@@ -2503,8 +2860,6 @@ export async function runWorkflow(options) {
     waitUntil = 'domcontentloaded',
     token = null,
     cookie = null,
-    chaos = false,
-    chaosSeed = null,
     geo = null,
     timezone = null,
     permissions = null,
@@ -2595,7 +2950,7 @@ export async function runWorkflow(options) {
         origin: resolvePermissionOrigin(permissionOrigin || workflowOriginUrl)
       });
     }
-    await configureContextFeatures(context, activePage, { network, redact, token, cookie, chaos, chaosSeed, url: workflowOriginUrl });
+    await configureContextFeatures(context, activePage, { network, redact, token, cookie, url: workflowOriginUrl });
 
     let traceStarted = false;
     let tracePath = null;
@@ -2646,7 +3001,7 @@ export async function runWorkflow(options) {
         activePage = newPage;
         attachWorkflowDiagnostics(newPage);
         await newPage.waitForLoadState().catch(() => {});
-        await configureContextFeatures(context, newPage, { network, redact, token, cookie, chaos, chaosSeed, url: workflowOriginUrl });
+        await configureContextFeatures(context, newPage, { network, redact, token, cookie, url: workflowOriginUrl });
         if (redact) await applyRedaction(newPage);
       })().catch(err => {
         appendBounded(consoleErrors, { type: 'browser-tool-error', text: errorMessage(err).slice(0, 300), url: sanitizeUrl(newPage.url()) });
@@ -3176,8 +3531,6 @@ export async function runFullQA(options = {}) {
     mode = 'standard',
     presets = null,
     testWorkflow = null,
-    generateReport = false,
-    reportPath = './qa-report.html',
     headless = true,
     authStatePath = null,
     channel = null,
@@ -3186,8 +3539,6 @@ export async function runFullQA(options = {}) {
     waitUntil = 'domcontentloaded',
     token = null,
     cookie = null,
-    chaos = false,
-    chaosSeed = null,
     geo = null,
     timezone = null,
     redact = false,
@@ -3232,9 +3583,6 @@ export async function runFullQA(options = {}) {
   const normalizedAllowedHosts = normalizeAllowedHosts(allowedHosts);
   const normalizedIgnoreUrls = normalizeIgnoreUrls(ignoreUrls);
   assertInitialNavigationAllowed(targetFrontendUrl, normalizedSafetyMode, normalizedAllowedHosts);
-  if (normalizedSafetyMode === 'safe' && generateReport) {
-    assertPathWithinWorkspace(path.resolve(process.cwd(), reportPath));
-  }
 
   const log = (...args) => { if (!json) console.log(...args); };
   const logError = (...args) => { if (!json) console.error(...args); };
@@ -3278,17 +3626,6 @@ export async function runFullQA(options = {}) {
       layout: layoutEnabled ? { error: reason } : null,
       workflow: testWorkflow ? { error: reason } : null
     };
-    if (generateReport) {
-      await createHtmlReport({
-        reportPath: path.resolve(process.cwd(), reportPath),
-        passed: false,
-        url: sanitizeUrl(targetFrontendUrl),
-        probe: preflightFailure.probe,
-        responsive: preflightFailure.responsive,
-        layout: preflightFailure.layout,
-        workflow: preflightFailure.workflow
-      });
-    }
     return preflightFailure;
   }
 
@@ -3309,8 +3646,6 @@ export async function runFullQA(options = {}) {
       waitUntil,
       token,
       cookie,
-      chaos,
-      chaosSeed,
       geo,
       timezone,
       redact,
@@ -3350,8 +3685,6 @@ export async function runFullQA(options = {}) {
       waitUntil,
       token,
       cookie,
-      chaos,
-      chaosSeed,
       geo,
       timezone,
       redact,
@@ -3386,8 +3719,6 @@ export async function runFullQA(options = {}) {
         network,
         token,
         cookie,
-        chaos,
-        chaosSeed,
         geo,
         timezone,
         redact,
@@ -3422,8 +3753,6 @@ export async function runFullQA(options = {}) {
         waitUntil,
         token,
         cookie,
-        chaos: chaos || Boolean(wf.chaos),
-        chaosSeed: chaosSeed ?? wf.chaosSeed ?? null,
         geo,
         timezone,
         redact: redact || Boolean(wf.redact),
@@ -3485,19 +3814,6 @@ export async function runFullQA(options = {}) {
   );
   const overallPassed = probeQuality.healthy && responsiveQuality.healthy && layoutQuality.healthy && workflowQuality;
 
-  if (generateReport) {
-    await createHtmlReport({
-      reportPath: path.resolve(process.cwd(), reportPath),
-      passed: overallPassed,
-      url: sanitizeUrl(targetFrontendUrl),
-      probe: probeResult,
-      responsive: responsiveResult,
-      layout: layoutResult,
-      workflow: workflowResult
-    });
-    log(`\n  📄 Standalone HTML Report Generated: ${path.resolve(process.cwd(), reportPath)}`);
-  }
-
   log(`\n================ QA SCORECARD ================`);
   log(`Overall Result: ${overallPassed ? 'PASSED ✅' : 'ATTENTION NEEDED ⚠️'}`);
   log(`Frontend Health: ${probeQuality.healthy ? 'OK (Status ' + probeResult.httpStatus + ')' : 'FAILED ❌'}`);
@@ -3511,64 +3827,11 @@ export async function runFullQA(options = {}) {
   }
 }
 
-async function createHtmlReport(data) {
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>QA Health Report - ${escapeHtml(data.url)}</title>
-  <style>
-    :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --border: #334155; --success: #22c55e; --warn: #eab308; --fail: #ef4444; }
-    body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; margin: 0; }
-    .container { max-width: 1100px; margin: 0 auto; }
-    .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 1.5rem; }
-    .badge { padding: 0.4rem 1rem; border-radius: 9999px; font-weight: bold; font-size: 0.9rem; }
-    .badge-pass { background: rgba(34,197,94,0.2); color: var(--success); border: 1px solid var(--success); }
-    .badge-fail { background: rgba(239,68,68,0.2); color: var(--fail); border: 1px solid var(--fail); }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.5rem; margin: 2rem 0; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.5rem; }
-    .card-title { font-size: 0.85rem; color: var(--muted); text-transform: uppercase; }
-    .card-value { font-size: 1.75rem; font-weight: bold; margin-top: 0.5rem; }
-    .section { background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.5rem; margin-bottom: 1.5rem; }
-    h2 { font-size: 1.25rem; margin-top: 0; }
-    code { background: rgba(0,0,0,0.3); padding: 0.2rem 0.4rem; border-radius: 0.25rem; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div><h1 style="margin:0 0 0.5rem 0;">Browser QA Health Report</h1><div style="color: var(--muted);">Target URL: <code>${escapeHtml(data.url)}</code> &bull; ${escapeHtml(new Date().toLocaleString())}</div></div>
-      <div class="badge ${data.passed ? 'badge-pass' : 'badge-fail'}">${data.passed ? 'ALL CHECKS PASSED' : 'ACTION REQUIRED'}</div>
-    </div>
-    <div class="grid">
-      <div class="card"><div class="card-title">HTTP Status</div><div class="card-value">${data.probe?.httpStatus || 'N/A'}</div></div>
-      <div class="card"><div class="card-title">Load Duration</div><div class="card-value">${data.probe?.loadTimeMs || 0}ms</div></div>
-      <div class="card"><div class="card-title">A11y Issues</div><div class="card-value" style="color:${(data.probe?.diagnostics?.a11y?.totalIssues || 0) > 0 ? 'var(--warn)' : 'var(--success)'};">${data.probe?.diagnostics?.a11y?.totalIssues || 0}</div></div>
-      <div class="card"><div class="card-title">Responsive Views</div><div class="card-value">${data.responsive?.totalCaptured || 0}</div></div>
-      <div class="card"><div class="card-title">Mobile Layout</div><div class="card-value">${data.layout?.error ? 'ERROR' : data.layout ? (data.layout.hasHorizontalOverflow ? 'OVERFLOW' : 'OK') : 'SKIPPED'}</div></div>
-    </div>
-    ${data.probe?.diagnostics?.a11y?.totalIssues > 0 ? `
-    <div class="section"><h2 style="color:var(--warn);">Accessibility Findings</h2><ul>${data.probe.diagnostics.a11y.issues.map(i => `<li><b>${escapeHtml(i.type)}</b>: <code>${escapeHtml(i.element)}</code></li>`).join('')}</ul></div>` : ''}
-    ${data.layout?.overflowingElementsCount > 0 || data.layout?.smallTapTargetsCount > 0 ? `
-    <div class="section"><h2 style="color:var(--warn);">Mobile Layout Findings</h2><ul>
-      ${(data.layout.overflowingElements || []).map(item => `<li>Overflow: <code>${escapeHtml(item.tag)}</code> by ${escapeHtml(item.overflowPx)}px</li>`).join('')}
-      ${(data.layout.smallTapTargets || []).map(item => `<li>Small tap target: <code>${escapeHtml(item.tag)}</code> (${escapeHtml(item.size)})</li>`).join('')}
-    </ul></div>` : ''}
-    ${data.probe?.consoleLogs?.errors?.length > 0 ? `
-    <div class="section"><h2 style="color:var(--fail);">Console Errors</h2><ul>${data.probe.consoleLogs.errors.map(e => `<li><code>${escapeHtml(e.type)}</code>: ${escapeHtml(e.text)}</li>`).join('')}</ul></div>` : ''}
-    ${data.workflow?.liveDiagnostics?.consoleErrors?.length > 0 ? `
-    <div class="section"><h2 style="color:var(--fail);">Workflow Console Errors</h2><ul>${data.workflow.liveDiagnostics.consoleErrors.map(e => `<li><code>${escapeHtml(e.type)}</code>: ${escapeHtml(e.text)}</li>`).join('')}</ul></div>` : ''}
-  </div>
-</body>
-</html>`;
-  await fs.writeFile(data.reportPath, html, 'utf-8');
-}
-
 // ==========================================
 // 9. VISUAL DIFF
 // ==========================================
 export async function compareVisualDiff(options) {
-  const { url, baselinePath, threshold = 0.05, outputDiffPath = './screenshots/visual-diff.png', headless = true, channel = null, executablePath = null, waitUntil = 'domcontentloaded', authStatePath = null, token = null, cookie = null, redact = false, preset = 'desktop', customViewport = null, network = null, chaos = false, chaosSeed = null, geo = null, timezone = null, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, freezeAnimations = true, visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT, browser: providedBrowser = null, channelUsed: providedChannelUsed = null } = options;
+  const { url, baselinePath, threshold = 0.05, outputDiffPath = './screenshots/visual-diff.png', headless = true, channel = null, executablePath = null, waitUntil = 'domcontentloaded', authStatePath = null, token = null, cookie = null, redact = false, preset = 'desktop', customViewport = null, network = null, geo = null, timezone = null, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, freezeAnimations = true, visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT, browser: providedBrowser = null, channelUsed: providedChannelUsed = null } = options;
   if (!url || !baselinePath) throw new Error('URL and --baseline path required.');
   const targetUrl = resolveWorkflowUrl(url);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
@@ -3600,7 +3863,7 @@ export async function compareVisualDiff(options) {
     if (timezone) contextOptions.timezoneId = timezone;
     context = await browser.newContext(contextOptions);
     const page = await context.newPage();
-    await configureContextFeatures(context, page, { network, token, cookie, redact, chaos, chaosSeed, geo, timezone, url: targetUrl });
+    await configureContextFeatures(context, page, { network, token, cookie, redact, geo, timezone, url: targetUrl });
     await page.goto(targetUrl, { waitUntil, timeout: 30000 });
     assertFinalNavigationAllowed(page, targetUrl, normalizedSafetyMode, normalizedAllowedHosts);
     if (redact) await applyRedaction(page);
@@ -3793,8 +4056,6 @@ COMMON OPTIONS:
   --token=<value>               Scope Authorization to the target origin
   --cookie=<str>                Add cookies for the target URL
   --network=<profile>           Throttle: slow-3g, fast-3g, or offline
-  --chaos                      Add bounded request failures and jitter for resilience checks
-  --chaos-seed=<value>          Repeat the same chaos sequence for reproducible failures
   --geo=<lat,lng>               Simulate geolocation
   --timezone=<id>               Simulate timezone
   --permissions=<list>          Grant permissions such as geolocation (workflow/session)
@@ -3832,7 +4093,6 @@ VISUAL OPTIONS:
 QA OPTIONS:
   --workflow=<path>             Behavioral workflow to include in qa
   --mode=<name>                 QA scope: smoke (desktop), standard (desktop+mobile), release (all presets)
-  --report                      Write qa-report.html
   --max-a11y-issues=<n>         Allowed accessibility findings
   --max-network-errors=<n>      Allowed HTTP/request failures
   --max-console-errors=<n>      Allowed console errors
@@ -3869,7 +4129,6 @@ async function cliMain() {
   const executablePath = options.executable || options['executable-path'] || null;
   const readySelector = options.ready || options['ready-selector'] || null;
   const readyTimeout = options['ready-timeout'] || DEFAULT_PAGE_READY_TIMEOUT;
-  const chaosSeed = options['chaos-seed'] ?? null;
   const freezeAnimations = options['no-freeze'] !== true;
   const safetyModeOptionProvided = options.safetyMode !== undefined || options['safety-mode'] !== undefined || options.safe === true || options['safe-mode'] === true || options.unsafe === true;
   let outputLimit = DEFAULT_MAX_OUTPUT_CHARS;
@@ -3912,8 +4171,6 @@ async function cliMain() {
         maxOutputChars: outputLimit,
         maxSessions: options.maxSessions ?? options['max-sessions'] ?? DEFAULT_MAX_AGENT_SESSIONS,
         idleTimeout: options.idleTimeout ?? options['idle-timeout'] ?? DEFAULT_SESSION_IDLE_TIMEOUT,
-        chaosSeed,
-        chaos: Boolean(options.chaos),
         safetyMode: safetyModeOptionProvided ? safetyMode : undefined,
         allowedHosts: allowedHosts.length > 0 ? allowedHosts : undefined,
         ignoreUrls,
@@ -3957,8 +4214,6 @@ async function cliMain() {
         token: options.token || null,
         cookie: options.cookie || null,
         network: options.network || null,
-        chaos: Boolean(options.chaos),
-        chaosSeed,
         geo: options.geo || null,
         timezone: options.timezone || null,
         redact: Boolean(options.redact),
@@ -3999,8 +4254,6 @@ async function cliMain() {
         token: options.token || null,
         cookie: options.cookie || null,
         network: options.network || null,
-        chaos: Boolean(options.chaos),
-        chaosSeed,
         geo: options.geo || null,
         timezone: options.timezone || null,
         redact: Boolean(options.redact),
@@ -4032,8 +4285,6 @@ async function cliMain() {
         testWorkflow: options.workflow || null,
         mode: options.mode || 'standard',
         presets: options.preset || options.presets || undefined,
-        generateReport: Boolean(options.report || options.htmlReport),
-        reportPath: options.reportPath || './qa-report.html',
         headless: options.headless !== false,
         authStatePath: options.auth || null,
         channel: selectedChannel,
@@ -4041,9 +4292,6 @@ async function cliMain() {
         network: options.network || null,
         token: options.token || null,
         cookie: options.cookie || null,
-        chaos: Boolean(options.chaos),
-        chaosSeed,
-        redact: Boolean(options.redact),
         geo: options.geo || null,
         timezone: options.timezone || null,
         safetyMode,
@@ -4089,9 +4337,6 @@ async function cliMain() {
         token: options.token || null,
         cookie: options.cookie || null,
         ignoreUrls,
-        chaos: Boolean(options.chaos),
-        chaosSeed,
-        redact: Boolean(options.redact),
         geo: options.geo || null,
         timezone: options.timezone || null,
         hover: options.hover || null,
@@ -4141,8 +4386,6 @@ async function cliMain() {
         network: options.network || null,
         token: options.token || null,
         cookie: options.cookie || null,
-        chaos: Boolean(options.chaos),
-        chaosSeed,
         geo: options.geo || null,
         timezone: options.timezone || null,
         redact: Boolean(options.redact),
@@ -4186,8 +4429,6 @@ async function cliMain() {
         preset: options.preset || 'desktop',
         customViewport,
         network: options.network || null,
-        chaos: Boolean(options.chaos),
-        chaosSeed,
         geo: options.geo || null,
         timezone: options.timezone || null,
         safetyMode,
@@ -4233,8 +4474,6 @@ async function cliMain() {
         network: options.network || workflowData.network || null,
         token: options.token || workflowData.token || null,
         cookie: options.cookie || workflowData.cookie || null,
-        chaos: Boolean(options.chaos || workflowData.chaos),
-        chaosSeed: options['chaos-seed'] ?? workflowData.chaosSeed ?? null,
         geo: options.geo || workflowData.geo || null,
         timezone: options.timezone || workflowData.timezone || null,
         readySelector,
@@ -4297,6 +4536,16 @@ async function cliMain() {
   }
 }
 
-if (process.argv[1] && (path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url)))) {
+const isMainEntry = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    // Compare real paths so npm link / junction / symlink installs match too.
+    return path.resolve(realpathSync(process.argv[1])) === path.resolve(realpathSync(fileURLToPath(import.meta.url)));
+  } catch {
+    return path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+  }
+})();
+
+if (isMainEntry) {
   cliMain();
 }

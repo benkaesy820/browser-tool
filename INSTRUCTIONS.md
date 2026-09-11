@@ -1,85 +1,91 @@
-# Browser Tool Instructions
+# Browser Tool Instructions (for agents)
 
-Use this tool to give agents a small, reliable browser interface. Prefer semantic observations and stable references over raw HTML, screenshots, or arbitrary selectors.
+`browser-tool` gives you a real Chromium-compatible browser through one CLI. Reach for it when eyes beat source: visual checks, tap targets, console/network evidence, and multi-step flows with assertions. For static facts (response shapes, API health without rendering), prefer `probe --json` or the repo's own checks first — do not open a browser to answer a non-visual question.
 
-## Setup check
+## 1. Setup (once per machine)
 
-Run `npm ci`, then `npm run doctor`. If no candidate is available, run `npm run browsers:install` or provide a managed Chromium executable with `--executable`. The normal selection order is bundled Playwright Chromium, installed Chrome, installed Edge, then an explicit executable. `doctor` reports every attempted candidate so a missing browser is diagnosable instead of looking like an application failure.
+```bash
+npm ci
+npm run doctor
+```
 
-The supported automatic path is Chromium-compatible. The tool uses Chromium CDP for network emulation and related diagnostics; Firefox and WebKit are not silently substituted because their behavior and feature support are not identical.
+`doctor --json` tries each browser candidate in order — bundled Chromium, installed Chrome, installed Edge, then `--executable=/path/to/chrome` — and reports every attempt, so a missing browser looks diagnosable instead of looking like an app failure. If no candidate exists, run `npm run browsers:install`. Pin a channel with `--browser=msedge` (or `chrome`); `auto` (default) follows the order above. Only Chromium-compatible browsers are supported: network emulation and related diagnostics use Chromium CDP, so Firefox/WebKit are never silently substituted.
 
-## Default agent loop
+## 2. Discover before acting
 
-1. Start `browser-tool serve` once.
+Run `browser-tool capabilities --json` first when the protocol is unknown. It returns the exact session/workflow actions, event names, safety modes, and default/maximum limits — plan bounded requests from it instead of trial and error. The same discovery exists inside a running session as `{"op":"capabilities"}`.
+
+## 3. The default loop (persistent session)
+
+1. Start `browser-tool serve` once (JSONL over stdin/stdout — no ports, no polling).
 2. Send `open` with a URL.
-3. Read the bounded observation and choose a control by its `ref`.
-4. Send one `act` operation.
-5. Observe again because references are invalidated after actions.
-6. Close the session when finished.
-
-Example:
+3. Read the bounded observation, pick a control by its `ref`.
+4. Send `act` with `"observe": true, "mode": "delta"` — action plus fresh observation in one response.
+5. Use `batch` (selectors, stop-on-error, per-step evidence) for multi-field forms.
+6. `close` when finished. `close` is idempotent, and `{"op":"sessions"}` rediscovers live sessions after a crash.
 
 ```text
-{"op":"open","sessionId":"app","url":"http://localhost:5173","maxItems":30,"maxText":500}
+{"op":"open","sessionId":"app","url":"http://localhost:5173","maxItems":30,"maxText":500,"view":"controls"}
 {"op":"act","sessionId":"app","action":"fill","ref":"e2","text":"hello"}
-{"op":"act","sessionId":"app","action":"click","ref":"e3"}
-{"op":"observe","sessionId":"app"}
+{"op":"act","sessionId":"app","action":"click","ref":"e3","observe":true,"mode":"delta"}
 {"op":"close","sessionId":"app"}
 ```
 
-The observation is intentionally bounded. It includes page identity, headings, landmarks, visible text, control names/state, selectors as a fallback, semantic locator hints, and lightweight console/network diagnostics. Do not request raw page HTML unless a workflow explicitly needs evaluation. Every JSONL response echoes `requestId` and errors include a machine-readable `code`. Send `capabilities` first when the protocol is unknown; it exposes exact session/workflow actions, event names, safety modes, and default/maximum limits. After the first observation, use `mode:"delta"` and `since` to receive only changes; a stale baseline safely returns a full observation.
+Refs invalidate after every act. A stale ref is auto-recovered only when the element is provably unambiguous (same role + name + group size); recovery is reported as `refRecovered`, every act reports `actedOn`, and anything else fails fast with an evidenced `STALE_REF`. On `STALE_REF`, re-observe with `mode:"delta"` (cheap) — never retry the same dead ref. Disable recovery per act (`recoverRef:false`) or per session (`autoRecoverRefs:false`) only with a reason.
 
-For asynchronous behavior, use `subscribe` and `watch` instead of repeatedly asking for the same state:
+## 4. Command choice
 
-```text
-{"requestId":"6","op":"subscribe","sessionId":"app","subscriptionId":"status-events","events":["navigation","watch.matched","network.error"]}
-{"requestId":"7","op":"watch","sessionId":"app","watcherId":"saved","selector":"#status","containsText":"Saved","timeout":30000}
-```
-
-Event lines have `type:"event"` and an `eventId`; responses have `requestId`. The local transport intentionally remains JSONL over stdin/stdout. WebSocket/SSE is only appropriate when the browser is moved to a remote service. Watchers are mutation-event driven; their timeout prevents an infinite wait but is not the synchronization mechanism. A session accepts at most 32 subscriptions and 32 watchers.
-
-## Command choice
-
-- `capabilities`: browser-free protocol/action/event/limit discovery; use it before hard-coding a client.
-- `doctor`: verify the available browser before a run.
-- `serve` / `session`: persistent interactive browser work.
-- `map`: one-shot semantic observation.
+- `capabilities`: browser-free protocol/limit discovery. Start here when unsure.
+- `doctor`: verify a usable browser before a run.
+- `serve`: persistent interactive work (the loop above).
+- `map`: one-shot semantic observation of a URL.
 - `probe`: health, console, network, request-failure, broken-image, and accessibility checks.
-- `qa`: probe plus responsive captures, optional mobile layout checks, and an optional workflow. Smoke is desktop-only unless a mobile preset is explicitly selected.
-- `interact`: repeatable multi-step behavior with step-level evidence, downloads, dialogs, and permissions.
-- `screenshot`: visual evidence for selected presets, elements, regions, hover states, or themes.
-- `diff`: decoded PNG pixel comparison against a baseline.
-- `layout`: mobile overflow and small tap-target check.
-- `clean`: remove recognized screenshot, video, and trace artifacts; use `--all` only when the folder is disposable.
+- `qa`: probe + responsive captures + optional mobile layout + optional workflow, sharing one browser process with isolated contexts. `--mode=smoke` (desktop only), `standard` (desktop+mobile, default), `release` (all viewports).
+- `interact`: repeatable multi-step workflow file with step-level evidence. See `workflows/example.json` for the runnable shape (needs your app serving the referenced routes).
+- `screenshot`: visual evidence for presets, elements, regions, hover states, themes.
+- `diff`: pixel comparison against a committed baseline (keep baselines under `tests/visual-baselines/`, same `--preset`/`--size` for create and compare).
+- `layout`: mobile overflow + small tap-target check for one preset.
+- `presets`: list viewport presets, network profiles, QA modes.
+- `clean`: remove recognized screenshot/video/trace artifacts (`--all` only when the folder is disposable).
 
-Use `--json` for agent consumption. Bound observations with `--max-items` and `--max-text`, and cap each response with `--max-output-chars` (20,000 by default). The CLI keeps non-boolean values as strings, which preserves numeric-looking tokens, cookies, paths, and selectors. Use `--ready=<css>` for an application-owned ready signal; fixed delays are optional and default to zero. Use `--ignore-urls=<patterns>` for known third-party diagnostic noise. Visual output, video, HTML reports, traces, and chaos testing are opt-in. For `qa`, use `--mode=smoke` for a fast desktop check, `standard` for desktop+mobile, or `release` for every viewport. QA reuses one browser process while preserving isolated contexts. Mobile tap-target findings are reported but do not fail QA unless `--max-small-tap-targets=<n>` is supplied.
+Always pass `--json` for agent consumption.
 
-Persistent sessions are limited to 8 and expire after 30 minutes of inactivity by default. Use `capabilities` to discover protocol limits before sending work.
+## 5. Bounds (respect them, do not fight them)
 
-## Authentication and privacy
+- Observations: `--max-items` (default 40), `--max-text` (default 700); `view:"controls"` skips text/headings/landmarks (~half the tokens); `mode:"delta"` returns only changes after the first observation.
+- One response is capped at `--max-output-chars` (default 20,000, cut at a structured boundary).
+- `batch`: max 25 steps, stop-on-first-error by default, selectors inside batches (refs invalidate per act).
+- Workflow files: validated before launch, max 200 steps and 2 MB, unknown actions rejected.
+- Sessions: max 8 alive, 30-minute idle expiry (`--max-sessions`, `--idle-timeout` to adjust); max 32 subscriptions and 32 watchers per session.
 
-Prefer `--auth=state.json` for saved cookies and local storage. `--token` and `--cookie` require a target URL and are scoped to that URL's origin. Never place long-lived secrets in workflows or logs when an auth state file is available. Use `--redact` before recording or taking screenshots of authenticated pages. Trace archives can include DOM snapshots and network details even when screenshots are redacted, so treat traces as sensitive evidence.
+## 6. Async without polling
 
-## Workflow rules
+For anything asynchronous, `subscribe` to semantic events (`navigation`, `console.error`, `network.error`, `request.failed`, `page.crash`, `page.closed`, `dialog`, `download`, `watch.matched`, `watch.timeout`, `watch.error`, …) and `watch` DOM conditions instead of re-asking for state. Watchers are mutation-event driven; the timeout is only a safety ceiling. `unsubscribe`/`unwatch` when done. Event lines carry `type:"event"` + `eventId`; responses echo `requestId`. Never stream raw DOM mutations. (WebSocket/SSE transports only matter if the browser ever moves remote.)
 
-Workflows must contain at least one step. Use explicit actions instead of automatic form fuzzing:
+## 7. Reliability controls
 
-- Navigation: `navigate` / `goto`
-- Interaction: `click`, `fill` / `type`, `check`, `uncheck`, `select`, `press`, `hover`, `scroll`
-- Synchronization: `wait`
-- Verification: `assert`, `scrape` / `getText`
-- Advanced flows: `upload` / `setInputFiles`, `dragAndDrop` / `drag`, `switchTab`, `mockRoute` / `mockApi`, `saveState`, `evaluate`, `download`, `dialog`, `permissions`, `screenshot`
+- `--ready=<css>` waits for an app-owned readiness signal; `--delay=<ms>` only for animations that need it (default 0).
+- `--ignore-urls=<patterns>` filters known third-party diagnostic noise.
+- `--no-freeze` keeps animations running; by default captures freeze transitions and wait for fonts/images.
+- `--max-concurrency=<n>` bounds simultaneous screenshot contexts.
+- `--max-small-tap-targets=<n>` turns tap-target findings into a QA gate (report-only otherwise).
+- `--trace=on-failure` keeps a Playwright trace only on failure/warning; inspect with `npx playwright show-trace <zip>`.
+- `--allow-warnings` keeps a soft workflow warning from failing the exit code.
 
-Workflow input is validated before launch, capped at 200 steps and 2 MB, and rejects unknown actions or missing required fields.
+## 8. Auth, safety, privacy
 
-Use `frame` when a target is inside an iframe. A `press` step with `selector` targets that element; a bare `scroll` moves to the bottom of the document. Use `soft` or `optional` only for non-critical assertions. Keep screenshots and recordings as explicit steps so normal agent runs remain cheap. The runner does not retry side-effecting actions unless explicitly configured with `retrySideEffects: true` or `--retry-side-effects`. Use `safetyMode:"safe"` or `--safe` for untrusted browser runs; add `allowedHosts` for approved cross-origin navigation. Safe mode applies to one-shot navigation and workflow runs, blocks unsafe file navigation, and validates generated artifact paths against the real workspace, including symlink/junction targets.
+- Prefer `--auth=state.json` (saved cookies/storage). `--token`/`--cookie` require a target URL and scope to its origin.
+- `--safe` disables workflow evaluation, blocks unapproved cross-origin and unsafe file navigation, and confines artifacts/uploads/downloads to the workspace (+ `--allowed-hosts` for extras).
+- `--redact` before screenshots/recordings of authenticated pages. Traces can contain DOM snapshots and network details even when redacted — treat them as sensitive, and note tracing stays blocked under `--redact` unless `--allow-sensitive-trace` is given.
 
-Use a `dialog` step immediately before the action that should open a JavaScript dialog. The runner fails if the expected dialog does not appear, including when the workflow ends after the dialog step. Use `download` with the selector that starts a download; it returns the saved path. Use `permissions` with an explicit HTTP origin, or `{ "clear": true }` to remove grants. Visual screenshots freeze animations and wait briefly for fonts/images unless `--no-freeze` is requested.
+## 9. Workflow rules
 
-For local fixture navigation, use `file://{{cwd}}/fixtures/browser-playground.html`; do not hardcode a machine-specific checkout path.
+- At least one step; explicit actions only — no crawlers, fuzzing, or auto-fill.
+- Navigation (`navigate`/`goto`), interaction (`click`, `fill`/`type`, `check`, `uncheck`, `select`, `press`, `hover`, `scroll`), sync (`wait`), verify (`assert`, `scrape`/`getText`), advanced (`upload`, `drag`/`dragDrop`… see `capabilities`; `frame` for iframes).
+- Put a `dialog` step immediately before the action that opens the dialog; it fails if none appears.
+- Non-idempotent actions never retry unless `retrySideEffects` is explicit. `soft`/`optional` only for non-critical assertions. Keep screenshots/recordings as explicit steps so normal runs stay cheap.
+- Treat a failed step as evidence: read `stepResults`, `error`, `behavioralWarnings`, and live diagnostics before retrying (see circuit-breaker discipline in the repo `AGENTS.md`/skill set — no third blind retry).
 
-## Failure handling
+## 10. What this tool refuses
 
-Treat a failed action or assertion as evidence, not as a successful flow. Inspect returned `stepResults`, `error`, `behavioralWarnings`, and live diagnostics before retrying. `--trace=on-failure` is the preferred debugging mode when a failure needs replayable evidence. Use `npx playwright show-trace <trace.zip>` to inspect it.
-
-The public surface is intentionally narrow. Link crawling, API harvesting, PDF export, design-token extraction, component ripping, DOM search, workflow code generation, and generic auto-fill are not part of this tool. They produce broad or fragile output and distract from the agent loop; use the application's source tools or explicit workflow actions for those tasks.
+Link crawling, API harvesting, PDF export, design-token extraction, component ripping, DOM search, workflow code generation, and generic form auto-fill are intentionally absent. They produce broad, fragile output; use application source tools or explicit workflow actions instead.

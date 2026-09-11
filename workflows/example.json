@@ -1,0 +1,9 @@
+{
+  "preset": "desktop",
+  "steps": [
+    {"action":"navigate","url":"http://localhost:5173/login"},
+    {"action":"fill","selector":"#email","text":"test@example.com"},
+    {"action":"click","selector":"button[type=submit]"},
+    {"action":"assert","selector":"h1","containsText":"Dashboard"}
+  ]
+}
