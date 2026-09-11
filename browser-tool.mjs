@@ -36,15 +36,11 @@ export const NETWORK_PROFILES = {
   'offline': { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 }
 };
 
-export const BROWSER_CANDIDATES = ['bundled-chromium', 'chrome', 'msedge'];
-
 export const QA_PRESET_MODES = {
   smoke: ['desktop'],
   standard: ['desktop', 'mobile'],
   release: ['desktop', 'laptop', 'tablet', 'tablet-landscape', 'mobile', 'mobile-small']
 };
-
-let detectedWorkingChannel = null;
 
 const DEFAULT_ACTION_TIMEOUT = 8000;
 const DEFAULT_AGENT_ITEM_LIMIT = 40;
@@ -123,100 +119,34 @@ class BrowserToolError extends Error {
 // ==========================================
 // 2. RESILIENT BROWSER LAUNCHER
 // ==========================================
-function getBrowserCandidates(channel = null) {
-  if (channel) return [channel];
-  const preferred = detectedWorkingChannel;
-  if (!preferred) return [...BROWSER_CANDIDATES];
-  return [preferred, ...BROWSER_CANDIDATES.filter(candidate => candidate !== preferred)];
-}
-
-function browserLaunchConfig(candidate, options) {
+function bundledLaunchConfig(options) {
   const { headless = true, slowMo = 0, devtools = false } = options;
-  return candidate === 'bundled-chromium'
-    ? { headless, slowMo, devtools, args: FAST_LAUNCH_ARGS }
-    : { channel: candidate, headless, slowMo, devtools, args: FAST_LAUNCH_ARGS };
+  return { headless, slowMo, devtools, args: FAST_LAUNCH_ARGS };
 }
 
 export async function launchResilientBrowser(options = {}) {
-  const {
-    headless = true,
-    slowMo = 0,
-    channel = null,
-    executablePath = null,
-    devtools = false
-  } = options;
-
-  if (executablePath) {
-    try {
-      const browser = await chromium.launch({
-        executablePath,
-        headless,
-        slowMo,
-        devtools,
-        args: FAST_LAUNCH_ARGS
-      });
-      return { browser, channelUsed: `custom-binary (${executablePath})`, attempts: [] };
-    } catch (err) {
-      const launchError = new Error(`[Browser Launcher] Custom Chromium executable failed: ${errorMessage(err)}`);
-      launchError.attempts = [{ candidate: `custom-binary (${executablePath})`, error: errorMessage(err) }];
-      throw launchError;
-    }
+  try {
+    const browser = await chromium.launch(bundledLaunchConfig(options));
+    return { browser, channelUsed: 'bundled-chromium', attempts: [] };
+  } catch (err) {
+    const launchError = new Error(`[Browser Launcher] Bundled Chromium failed: ${errorMessage(err)}. Repair it with "npm run browsers:install".`);
+    launchError.attempts = [{ candidate: 'bundled-chromium', error: errorMessage(err) }];
+    throw launchError;
   }
-
-  const failures = [];
-  for (const candidate of getBrowserCandidates(channel)) {
-    try {
-      const browser = await chromium.launch(browserLaunchConfig(candidate, { headless, slowMo, devtools }));
-      detectedWorkingChannel = candidate;
-      return { browser, channelUsed: candidate, attempts: failures };
-    } catch (err) {
-      failures.push({ candidate, error: errorMessage(err) });
-    }
-  }
-
-  const attempts = failures.map(failure => `${failure.candidate}: ${failure.error}`).join(' | ');
-  const launchError = new Error(`[Browser Launcher] No usable Chromium-compatible browser found. Tried ${attempts}. Install one with "npx playwright install chromium" or provide --executable=<path>.`);
-  launchError.attempts = failures;
-  throw launchError;
 }
 
 export async function checkBrowserAvailability(options = {}) {
-  const { headless = true, channel = null, executablePath = null } = options;
-  if (executablePath) {
-    let browser = null;
-    try {
-      browser = await chromium.launch({ executablePath, headless, args: FAST_LAUNCH_ARGS });
-      const version = browser.version();
-      return { status: 'ok', channelUsed: `custom-binary (${executablePath})`, browserVersion: version, attempts: [] };
-    } catch (err) {
-      return { status: 'error', channelUsed: null, browserVersion: null, attempts: [{ candidate: `custom-binary (${executablePath})`, error: errorMessage(err) }], installHint: 'Provide a working Chromium-based executable path.' };
-    } finally {
-      if (browser) await browser.close().catch(() => {});
-    }
+  const { headless = true } = options;
+  let browser = null;
+  try {
+    browser = await chromium.launch(bundledLaunchConfig({ headless }));
+    const version = browser.version();
+    return { status: 'ok', channelUsed: 'bundled-chromium', browserVersion: version, attempts: [] };
+  } catch (err) {
+    return { status: 'error', channelUsed: null, browserVersion: null, attempts: [{ candidate: 'bundled-chromium', error: errorMessage(err) }], installHint: 'Run "npm run browsers:install", then run the doctor again.' };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
-
-  const attempts = [];
-  for (const candidate of getBrowserCandidates(channel)) {
-    let browser = null;
-    try {
-      browser = await chromium.launch(browserLaunchConfig(candidate, { headless }));
-      const version = browser.version();
-      detectedWorkingChannel = candidate;
-      return { status: 'ok', channelUsed: candidate, browserVersion: version, attempts };
-    } catch (err) {
-      attempts.push({ candidate, error: errorMessage(err) });
-    } finally {
-      if (browser) await browser.close().catch(() => {});
-    }
-  }
-
-  return {
-    status: 'error',
-    channelUsed: null,
-    browserVersion: null,
-    attempts,
-    installHint: 'Run "npx playwright install chromium" or install Chrome/Edge, then run the doctor again.'
-  };
 }
 
 async function resolveBrowser(options = {}) {
@@ -225,8 +155,6 @@ async function resolveBrowser(options = {}) {
     channelUsed = null,
     headless = true,
     slowMo = 0,
-    channel = null,
-    executablePath = null,
     devtools = false
   } = options;
 
@@ -234,7 +162,7 @@ async function resolveBrowser(options = {}) {
     return { browser: providedBrowser, channelUsed: channelUsed || 'shared-browser', attempts: [], ownsBrowser: false };
   }
 
-  const launched = await launchResilientBrowser({ headless, slowMo, channel, executablePath, devtools });
+  const launched = await launchResilientBrowser({ headless, slowMo, devtools });
   return { ...launched, ownsBrowser: true };
 }
 
@@ -1682,9 +1610,7 @@ export async function createAgentSession(options = {}) {
   if (options.timezone) contextOptions.timezoneId = options.timezone;
 
   const { browser, channelUsed } = await launchResilientBrowser({
-    headless: options.headless !== false,
-    channel: options.channel || null,
-    executablePath: options.executablePath || null
+    headless: options.headless !== false
   });
   let context;
   let page;
@@ -2279,7 +2205,7 @@ export async function serveAgentSessions(defaultOptions = {}) {
 // 3. MOBILE OVERFLOW & LAYOUT BUG HUNTER (layout)
 // ==========================================
 export async function huntLayoutBugs(options) {
-  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, channel = null, executablePath = null, waitUntil = 'domcontentloaded', viewport = { width: 390, height: 844 }, authStatePath = null, token = null, cookie = null, network = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, tapTargetMinimum = 28 } = options;
+  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, waitUntil = 'domcontentloaded', viewport = { width: 390, height: 844 }, authStatePath = null, token = null, cookie = null, network = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, tapTargetMinimum = 28 } = options;
   if (!url) throw new Error('URL is required.');
   const targetUrl = resolveWorkflowUrl(url);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
@@ -2289,7 +2215,7 @@ export async function huntLayoutBugs(options) {
   validateViewport(viewport);
   const minimumTapTarget = Number(tapTargetMinimum);
   if (!Number.isFinite(minimumTapTarget) || minimumTapTarget < 1 || minimumTapTarget > 1000) throw new Error('Tap-target minimum must be between 1 and 1000 pixels.');
-  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, channel, executablePath });
+  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless });
   const { browser, channelUsed, ownsBrowser } = browserInfo;
   let context = null;
   try {
@@ -2367,7 +2293,7 @@ export async function huntLayoutBugs(options) {
 // 4. BOUNDED INTERACTIVE MAP (map)
 // ==========================================
 export async function mapInteractiveElements(options) {
-  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, channel = null, executablePath = null, authStatePath = null, waitUntil = 'domcontentloaded', token = null, cookie = null, network = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], maxItems = DEFAULT_AGENT_ITEM_LIMIT, maxText = DEFAULT_AGENT_TEXT_LIMIT, readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0 } = options;
+  const { url, browser: providedBrowser = null, channelUsed: providedChannelUsed = null, headless = true, authStatePath = null, waitUntil = 'domcontentloaded', token = null, cookie = null, network = null, geo = null, timezone = null, redact = false, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], maxItems = DEFAULT_AGENT_ITEM_LIMIT, maxText = DEFAULT_AGENT_TEXT_LIMIT, readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0 } = options;
   if (!url) throw new Error('URL is required.');
   const targetUrl = resolveWorkflowUrl(url);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
@@ -2376,7 +2302,7 @@ export async function mapInteractiveElements(options) {
   const agentMaxItems = normalizeAgentLimit(maxItems, 'maxItems', 1, 200) ?? DEFAULT_AGENT_ITEM_LIMIT;
   const agentMaxText = normalizeAgentLimit(maxText, 'maxText', 100, 4000) ?? DEFAULT_AGENT_TEXT_LIMIT;
 
-  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, channel, executablePath });
+  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless });
   const { browser, channelUsed, ownsBrowser } = browserInfo;
   let context = null;
   try {
@@ -2467,8 +2393,6 @@ export async function captureResponsiveScreenshots(options) {
     delay = 0,
     colorScheme = 'no-preference',
     headless = true,
-    channel = null,
-    executablePath = null,
     recordVideo = false,
     videoDir = './recordings',
     concurrency = true,
@@ -2539,7 +2463,7 @@ export async function captureResponsiveScreenshots(options) {
   if (!['no-preference', 'light', 'dark', 'both'].includes(colorScheme)) throw new Error(`Unknown color scheme: ${colorScheme}`);
   const concurrencyLimit = Math.max(1, Math.min(Number(maxConcurrency) || DEFAULT_SCREENSHOT_CONCURRENCY, 16));
 
-  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, channel, executablePath });
+  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless });
   const { browser, channelUsed, ownsBrowser } = browserInfo;
 
   const processConfig = async (config, currentTheme) => {
@@ -2642,8 +2566,6 @@ export async function probeUrl(options) {
     url,
     delay = 0,
     headless = true,
-    channel = null,
-    executablePath = null,
     takeScreenshot = false,
     outputDir = './screenshots',
     recordVideo = false,
@@ -2693,7 +2615,7 @@ export async function probeUrl(options) {
   let requestCount = 0;
 
   validateViewport(viewport);
-  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, channel, executablePath });
+  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless });
   const { browser, channelUsed, ownsBrowser } = browserInfo;
   let context = null;
 
@@ -2847,8 +2769,6 @@ export async function runWorkflow(options) {
     customViewport = null,
     headless = true,
     slowMo = 0,
-    channel = null,
-    executablePath = null,
     recordVideo = false,
     saveSnapshots = false,
     videoDir = './recordings',
@@ -2903,7 +2823,7 @@ export async function runWorkflow(options) {
     if (traceMode !== 'off') assertPathWithinWorkspace(resolvedTraceDir);
     if (resolvedSaveStatePath) assertPathWithinWorkspace(resolvedSaveStatePath);
   }
-  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, slowMo, channel, executablePath });
+  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, slowMo });
   const { browser, channelUsed, ownsBrowser } = browserInfo;
 
   const stepResults = [];
@@ -3533,8 +3453,6 @@ export async function runFullQA(options = {}) {
     testWorkflow = null,
     headless = true,
     authStatePath = null,
-    channel = null,
-    executablePath = null,
     network = null,
     waitUntil = 'domcontentloaded',
     token = null,
@@ -3591,7 +3509,7 @@ export async function runFullQA(options = {}) {
   let sharedBrowserInfo;
   let browserCheck;
   try {
-    sharedBrowserInfo = await resolveBrowser({ headless, channel, executablePath });
+    sharedBrowserInfo = await resolveBrowser({ headless });
     browserCheck = {
       status: 'ok',
       channelUsed: sharedBrowserInfo.channelUsed,
@@ -3605,7 +3523,7 @@ export async function runFullQA(options = {}) {
       channelUsed: null,
       browserVersion: null,
       attempts: err.attempts || [],
-      installHint: 'Run "npx playwright install chromium" or install Chrome/Edge, then run the doctor again.',
+      installHint: 'Run "npm run browsers:install", then run the doctor again.',
       error: reason
     };
     logError(`  -> Browser Preflight Failed: ${reason}`);
@@ -3640,8 +3558,7 @@ export async function runFullQA(options = {}) {
       browser: sharedBrowserInfo.browser,
       channelUsed: sharedBrowserInfo.channelUsed,
       authStatePath,
-      channel,
-      executablePath,
+
       network,
       waitUntil,
       token,
@@ -3677,8 +3594,7 @@ export async function runFullQA(options = {}) {
       channelUsed: sharedBrowserInfo.channelUsed,
       presets: selectedPresets,
       delay: 0,
-      channel,
-      executablePath,
+
       maxConcurrency,
       authStatePath,
       network,
@@ -3712,8 +3628,7 @@ export async function runFullQA(options = {}) {
         headless,
         browser: sharedBrowserInfo.browser,
         channelUsed: sharedBrowserInfo.channelUsed,
-        channel,
-        executablePath,
+
         viewport: layoutPreset.viewport,
         authStatePath,
         network,
@@ -3747,8 +3662,7 @@ export async function runFullQA(options = {}) {
         browser: sharedBrowserInfo.browser,
         channelUsed: sharedBrowserInfo.channelUsed,
         authStatePath,
-        channel,
-        executablePath,
+
         network,
         waitUntil,
         token,
@@ -3831,7 +3745,7 @@ export async function runFullQA(options = {}) {
 // 9. VISUAL DIFF
 // ==========================================
 export async function compareVisualDiff(options) {
-  const { url, baselinePath, threshold = 0.05, outputDiffPath = './screenshots/visual-diff.png', headless = true, channel = null, executablePath = null, waitUntil = 'domcontentloaded', authStatePath = null, token = null, cookie = null, redact = false, preset = 'desktop', customViewport = null, network = null, geo = null, timezone = null, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, freezeAnimations = true, visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT, browser: providedBrowser = null, channelUsed: providedChannelUsed = null } = options;
+  const { url, baselinePath, threshold = 0.05, outputDiffPath = './screenshots/visual-diff.png', headless = true, waitUntil = 'domcontentloaded', authStatePath = null, token = null, cookie = null, redact = false, preset = 'desktop', customViewport = null, network = null, geo = null, timezone = null, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, freezeAnimations = true, visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT, browser: providedBrowser = null, channelUsed: providedChannelUsed = null } = options;
   if (!url || !baselinePath) throw new Error('URL and --baseline path required.');
   const targetUrl = resolveWorkflowUrl(url);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
@@ -3851,7 +3765,7 @@ export async function compareVisualDiff(options) {
 
   const selectedPreset = VIEWPORT_PRESETS[preset] || VIEWPORT_PRESETS.desktop;
   const viewport = validateViewport(customViewport || selectedPreset.viewport);
-  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, channel, executablePath });
+  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless });
   const { browser, channelUsed, ownsBrowser } = browserInfo;
   let context = null;
   try {
@@ -4036,7 +3950,7 @@ Browser Tool — bounded browser automation for agents
 COMMANDS:
   capabilities [--json]         Show protocol, actions, events, and limits without launching a browser
   serve | session               Keep browser sessions alive over JSONL stdin/stdout
-  doctor                       Check which supported browser is available
+  doctor                       Verify the bundled browser launches
   map <url> [options]           One-shot bounded semantic map with stable refs
   probe <url> [options]         Health, console, network, and accessibility checks
   qa <url> [options]            Probe + responsive captures + optional workflow
@@ -4049,8 +3963,6 @@ COMMANDS:
 
 COMMON OPTIONS:
   --json                        Compact JSON output for agent ingestion
-  --browser=<channel>           Prefer chrome or msedge; bundled Chromium is the default first choice
-  --executable=<path>           Use a specific Chromium-based browser executable
   --auth=<path>                 Reuse saved cookies/localStorage state
   --save-state=<path>           Save workflow browser state
   --token=<value>               Scope Authorization to the target origin
@@ -4124,9 +4036,6 @@ async function cliMain() {
 
   const { positional, options } = parseCliArgs(rawArgs);
   const command = positional[0];
-  const requestedChannel = options.browser || options.channel || null;
-  const selectedChannel = requestedChannel === 'auto' ? null : requestedChannel;
-  const executablePath = options.executable || options['executable-path'] || null;
   const readySelector = options.ready || options['ready-selector'] || null;
   const readyTimeout = options['ready-timeout'] || DEFAULT_PAGE_READY_TIMEOUT;
   const freezeAnimations = options['no-freeze'] !== true;
@@ -4154,8 +4063,7 @@ async function cliMain() {
     if (command === 'serve' || command === 'session') {
       await serveAgentSessions({
         headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath,
+
         authStatePath: options.auth || null,
         token: options.token || null,
         cookie: options.cookie || null,
@@ -4183,14 +4091,12 @@ async function cliMain() {
 
     if (command === 'doctor') {
       const result = await checkBrowserAvailability({
-        headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath
+        headless: options.headless !== false
       });
       if (options.json) printCliJson(result);
       else if (result.status === 'ok') console.log(`Browser ready: ${result.channelUsed} (${result.browserVersion})`);
       else {
-        console.error('No usable Chromium-compatible browser was found.');
+        console.error('Bundled Chromium is not usable.');
         result.attempts.forEach(attempt => console.error(` - ${attempt.candidate}: ${attempt.error}`));
         console.error(result.installHint);
       }
@@ -4206,8 +4112,7 @@ async function cliMain() {
       const res = await huntLayoutBugs({
         url,
         headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath,
+
         waitUntil: options.waitUntil || options['wait-until'] || 'domcontentloaded',
         viewport: layoutPreset.viewport,
         authStatePath: options.auth || null,
@@ -4248,8 +4153,7 @@ async function cliMain() {
       const res = await mapInteractiveElements({
         url,
         headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath,
+
         authStatePath: options.auth || null,
         token: options.token || null,
         cookie: options.cookie || null,
@@ -4287,8 +4191,7 @@ async function cliMain() {
         presets: options.preset || options.presets || undefined,
         headless: options.headless !== false,
         authStatePath: options.auth || null,
-        channel: selectedChannel,
-        executablePath,
+
         network: options.network || null,
         token: options.token || null,
         cookie: options.cookie || null,
@@ -4328,8 +4231,7 @@ async function cliMain() {
         url,
         delay: options.delay === undefined ? 0 : Number(options.delay),
         headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath,
+
         takeScreenshot: Boolean(options.screenshot),
         recordVideo: Boolean(options.record),
         authStatePath: options.auth || null,
@@ -4378,8 +4280,7 @@ async function cliMain() {
         delay: options.delay === undefined ? 0 : Number(options.delay),
         colorScheme: options.theme || 'no-preference',
         headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath,
+
         recordVideo: Boolean(options.record),
         maxConcurrency: options['max-concurrency'] || DEFAULT_SCREENSHOT_CONCURRENCY,
         authStatePath: options.auth || null,
@@ -4419,8 +4320,7 @@ async function cliMain() {
         threshold: options.threshold === undefined ? 0.05 : Number(options.threshold),
         outputDiffPath: options.output || './screenshots/visual-diff.png',
         headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath,
+
         waitUntil: options.waitUntil || options['wait-until'] || 'domcontentloaded',
         authStatePath: options.auth || null,
         token: options.token || null,
@@ -4460,8 +4360,7 @@ async function cliMain() {
         steps,
         preset: options.preset || workflowData.preset || 'desktop',
         headless: options.headless !== false,
-        channel: selectedChannel,
-        executablePath,
+
         recordVideo: Boolean(options.record || workflowData.record),
         saveSnapshots: Boolean(options.snapshots || workflowData.snapshots),
         videoDir: options['video-dir'] || workflowData.videoDir || './recordings',

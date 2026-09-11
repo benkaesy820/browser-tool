@@ -6,10 +6,11 @@
 
 ```bash
 npm ci
+npm run browsers:install
 npm run doctor
 ```
 
-`doctor --json` tries each browser candidate in order — bundled Chromium, installed Chrome, installed Edge, then `--executable=/path/to/chrome` — and reports every attempt, so a missing browser looks diagnosable instead of looking like an app failure. If no candidate exists, run `npm run browsers:install`. Pin a channel with `--browser=msedge` (or `chrome`); `auto` (default) follows the order above. Only Chromium-compatible browsers are supported: network emulation and related diagnostics use Chromium CDP, so Firefox/WebKit are never silently substituted.
+The tool always uses Playwright's bundled Chromium — no channels, no fallback, no browser flags. `doctor --json` verifies the bundled browser launches and reports `bundled-chromium`; if it fails, re-run `npm run browsers:install`. Firefox/WebKit are not supported: network emulation and related diagnostics use Chromium CDP.
 
 ## 2. Discover before acting
 

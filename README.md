@@ -10,18 +10,9 @@ npm run browsers:install
 npm run doctor
 ```
 
-The tool chooses a browser deterministically:
+The tool always uses Playwright's bundled Chromium — no channels, no fallback chain, no browser flags. `npm ci` installs the library while `npm run browsers:install` downloads the tested Chromium binary; `doctor --json` verifies it launches and reports `bundled-chromium`.
 
-1. Playwright's bundled Chromium (the tested default).
-2. An installed Google Chrome channel.
-3. An installed Microsoft Edge channel.
-4. A browser supplied explicitly with `--executable=/path/to/chrome`.
-
-`browser-tool doctor --json` checks the same candidates without opening a page. A successful candidate is remembered for the rest of the process, so later operations do not keep retrying failed choices. `--browser=auto` selects the default policy; `--browser=chrome` or `--browser=msedge` narrows it to one channel.
-
-The fallback policy intentionally targets Chromium-compatible browsers. Several features use Chromium's CDP protocol, including network emulation, so Firefox and Safari/WebKit are not silently treated as equivalent. Add a browser-specific adapter only if cross-engine coverage becomes a requirement.
-
-The Playwright package is pinned to `1.62.1` in `package.json` and `package-lock.json` so the JavaScript API and browser expectations are repeatable. The separate browser download is intentional: `npm ci` installs the library, while `npm run browsers:install` installs the tested Chromium binary. If Chrome or Edge is already managed on the machine, the tool can use those instead.
+Several features use Chromium's CDP protocol, including network emulation, so Firefox and Safari/WebKit are not supported. The Playwright package is pinned to `1.62.1` in `package.json` and `package-lock.json` so the JavaScript API and browser expectations are repeatable.
 
 ## Start with a persistent session
 
