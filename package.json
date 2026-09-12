@@ -1,7 +1,7 @@
 {
   "name": "browser-automation-tool",
   "version": "2.4.0",
-  "description": "Agent-first browser sessions, diagnostics, workflows, and visual evidence",
+  "description": "Agent-first browser sessions, diagnostics, and visual evidence",
   "type": "module",
   "main": "browser-tool.mjs",
   "files": [
@@ -10,8 +10,7 @@
     "browser-tool.cmd",
     "browser-tool.ps1",
     "README.md",
-    "INSTRUCTIONS.md",
-    "workflows/example.json"
+    "INSTRUCTIONS.md"
   ],
   "bin": {
     "browser-tool": "./browser-tool.mjs"
@@ -21,7 +20,6 @@
     "presets": "node browser-tool.mjs presets",
     "screenshot": "node browser-tool.mjs screenshot",
     "probe": "node browser-tool.mjs probe",
-    "interact": "node browser-tool.mjs interact",
     "doctor": "node browser-tool.mjs doctor",
     "browsers:install": "playwright install chromium",
     "test": "node --test",

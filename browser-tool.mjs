@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * Agent-first browser automation, diagnostics, workflows, and visual evidence.
+ * Agent-first browser automation, diagnostics, and visual evidence.
  * Single-file Playwright utility designed for bounded, low-token results.
  *
  * Core surface:
  * - Persistent JSONL sessions: open, observe, act, close.
- * - Bounded semantic maps, health probes, workflows, responsive screenshots, and pixel diffs.
+ * - Bounded semantic maps, health probes, responsive screenshots, and pixel diffs.
  * - Scoped auth, network simulation, geolocation, timezone, and sensitive-data redaction.
  */
 
@@ -55,32 +55,29 @@ const MAX_SESSION_DIAGNOSTICS = 500;
 const MAX_SESSION_SUBSCRIPTIONS = 32;
 const MAX_SESSION_WATCHERS = 32;
 const MAX_VIEWPORT_DIMENSION = 10000;
-const TRACE_MODES = new Set(['off', 'on', 'on-failure']);
 const SAFETY_MODES = new Set(['standard', 'safe', 'unsafe']);
 const SESSION_OPERATIONS = new Set(['capabilities', 'sessions', 'open', 'observe', 'act', 'batch', 'tabs', 'subscribe', 'unsubscribe', 'watch', 'unwatch', 'close', 'quit', 'exit']);
 const AGENT_ACTIONS = new Set(['click', 'fill', 'type', 'check', 'uncheck', 'select', 'selectOption', 'hover', 'press', 'scroll', 'navigate', 'goto', 'wait', 'assert', 'dialog', 'download', 'permissions', 'screenshot']);
-const WORKFLOW_ACTIONS = new Set(['navigate', 'goto', 'upload', 'setInputFiles', 'dragAndDrop', 'drag', 'switchTab', 'mockRoute', 'mockApi', 'saveState', 'dialog', 'download', 'permissions', 'click', 'fill', 'type', 'check', 'uncheck', 'select', 'selectOption', 'press', 'hover', 'scroll', 'wait', 'assert', 'scrape', 'getText', 'screenshot', 'evaluate']);
 const SESSION_EVENT_NAMES = new Set(['navigation', 'navigation.blocked', 'console.error', 'console.warning', 'network.error', 'request.failed', 'page.crash', 'page.closed', 'page.opened', 'dialog', 'download', 'watch.matched', 'watch.timeout', 'watch.error']);
 const DEFAULT_SESSION_EVENTS = [...SESSION_EVENT_NAMES];
-const MAX_WORKFLOW_STEPS = 200;
 const MAX_BATCH_STEPS = 25;
-const MAX_WORKFLOW_FILE_BYTES = 2_000_000;
 const DEFAULT_WATCH_TIMEOUT = 30_000;
 const MAX_WATCH_TIMEOUT = 10 * 60 * 1000;
 const WATCH_REGISTRY_KEY = '__browser_tool_watchers__';
 const PROTOCOL_VERSION = '1';
-const NON_IDEMPOTENT_WORKFLOW_ACTIONS = new Set([
-  'click', 'fill', 'type', 'check', 'uncheck', 'select', 'selectOption', 'press',
-  'upload', 'setInputFiles', 'drag', 'dragAndDrop', 'download', 'permissions',
-  'evaluate', 'mockRoute', 'mockApi', 'saveState'
-]);
 const DEFAULT_VISUAL_STABILITY_TIMEOUT = 5000;
-const MAX_WORKFLOW_RETRIES = 10;
+const DEFAULT_SCREENSHOT_DELAY = 250;
 const CLI_BOOLEAN_OPTIONS = new Set([
-  'allow-sensitive-trace', 'allow-overflow', 'allow-warnings', 'all',
+  'allow-overflow', 'all',
   'force', 'fullpage', 'headless', 'json', 'no-freeze',
-  'record', 'redact', 'retry-side-effects', 'safe', 'screenshot',
-  'skip-layout', 'snapshots', 'unsafe'
+  'redact', 'safe', 'screenshot', 'skip-layout', 'unsafe'
+]);
+const RETIRED_BROWSER_OPTIONS = new Set(['browser', 'channel', 'executable', 'executable-path']);
+const RETIRED_VISUAL_OPTIONS = new Set(['record']);
+const RETIRED_CLI_OPTIONS = new Set([
+  ...RETIRED_BROWSER_OPTIONS, ...RETIRED_VISUAL_OPTIONS, 'workflow',
+  'allow-warnings', 'retry-side-effects', 'snapshots', 'trace', 'trace-dir',
+  'allow-sensitive-trace', 'video-dir', 'video-filename', 'save-state'
 ]);
 const activeAgentSessions = new Map();
 // Session ids disposed moments ago, so cleanup `close` calls can be idempotent
@@ -263,7 +260,7 @@ async function configureContextFeatures(context, page, options = {}) {
     }
 
     // 5. Install redaction at document start and reapply after navigation so
-    // screenshots and recordings do not expose sensitive fields.
+    // screenshots do not expose sensitive fields.
     if (redact) await context.addInitScript({ content: REDACTION_INIT_SCRIPT });
     configuredContextFeatures.add(context);
   }
@@ -298,11 +295,6 @@ function parseViewportSize(size) {
   return validateViewport({ width, height });
 }
 
-function resolveTargetScope(page, frameSelector) {
-  if (!frameSelector) return page;
-  return page.frameLocator(frameSelector);
-}
-
 function redactSensitiveText(value) {
   return String(value ?? '')
     .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
@@ -328,47 +320,18 @@ function isConsoleWarningType(type) {
   return type === 'warning' || type === 'warn';
 }
 
-function normalizeRetryCount(value) {
-  const retries = value === undefined || value === null ? 0 : Number(value);
-  if (!Number.isInteger(retries) || retries < 0 || retries > MAX_WORKFLOW_RETRIES) {
-    throw new BrowserToolError('INVALID_RETRY_COUNT', `retries must be an integer from 0 to ${MAX_WORKFLOW_RETRIES}.`);
-  }
-  return retries;
-}
-
 function requireString(value, code, field) {
   if (typeof value !== 'string' || value.trim() === '') throw new BrowserToolError(code, `${field} must be a non-empty string.`);
   return value;
 }
 
-function validateWorkflowSteps(steps) {
-  if (!Array.isArray(steps) || steps.length === 0) throw new BrowserToolError('INVALID_WORKFLOW', 'Workflow must contain at least one step.');
-  if (steps.length > MAX_WORKFLOW_STEPS) throw new BrowserToolError('WORKFLOW_TOO_LARGE', `Workflow cannot contain more than ${MAX_WORKFLOW_STEPS} steps.`);
-  const retryCounts = [];
-  steps.forEach((step, index) => {
-    if (!step || typeof step !== 'object' || Array.isArray(step)) {
-      throw new BrowserToolError('INVALID_WORKFLOW_STEP', `Workflow step ${index + 1} must be a JSON object.`);
-    }
-    const action = requireString(step.action, 'INVALID_WORKFLOW_ACTION', `Workflow step ${index + 1} action`);
-    if (!WORKFLOW_ACTIONS.has(action)) throw new BrowserToolError('UNSUPPORTED_ACTION', `Unsupported action: "${action}".`, { step: index + 1, action });
-    retryCounts.push(normalizeRetryCount(step.retries));
-    if (['navigate', 'goto'].includes(action)) requireString(step.url, 'INVALID_WORKFLOW_STEP', `Workflow step ${index + 1} url`);
-    if (['click', 'fill', 'type', 'check', 'uncheck', 'select', 'selectOption', 'hover', 'assert', 'scrape', 'getText', 'upload', 'setInputFiles'].includes(action)) {
-      requireString(step.selector, 'INVALID_WORKFLOW_STEP', `Workflow step ${index + 1} selector`);
-    }
-    const hasUploadFiles = Array.isArray(step.files) ? step.files.length > 0 : Boolean(step.files || step.file || step.path);
-    if (['upload', 'setInputFiles'].includes(action) && !hasUploadFiles) {
-      throw new BrowserToolError('INVALID_WORKFLOW_STEP', `Workflow step ${index + 1} upload requires files, file, or path.`);
-    }
-    if (action === 'dragAndDrop' || action === 'drag') {
-      requireString(step.source || step.from, 'INVALID_WORKFLOW_STEP', `Workflow step ${index + 1} source`);
-      requireString(step.target || step.to, 'INVALID_WORKFLOW_STEP', `Workflow step ${index + 1} target`);
-    }
-    if (action === 'evaluate' && typeof step.fn !== 'function' && typeof step.fn !== 'string' && typeof step.script !== 'string') {
-      throw new BrowserToolError('INVALID_WORKFLOW_STEP', `Workflow step ${index + 1} evaluate requires fn or script.`);
-    }
-  });
-  return retryCounts;
+function validateObservationOptions(options) {
+  if (options.mode !== undefined && options.mode !== 'full' && options.mode !== 'delta') throw new BrowserToolError('INVALID_OBSERVE_MODE', 'observe mode must be full or delta.');
+  if (options.view !== undefined && !['standard', 'controls'].includes(options.view)) throw new BrowserToolError('INVALID_OBSERVE_VIEW', 'observe view must be standard or controls.');
+  if (options.since !== undefined) {
+    const since = Number(options.since);
+    if (!Number.isInteger(since) || since < 0) throw new BrowserToolError('INVALID_OBSERVE_BASELINE', 'observe since must be a non-negative integer generation.');
+  }
 }
 
 function validateSessionRequest(request) {
@@ -377,10 +340,7 @@ function validateSessionRequest(request) {
     throw new BrowserToolError('UNSUPPORTED_OPERATION', `Unsupported session operation: ${operation}`);
   }
   if (operation === 'open') requireString(request.url, 'MISSING_URL', 'open url');
-  if (operation === 'observe') {
-    if (request.mode !== undefined && request.mode !== 'full' && request.mode !== 'delta') throw new BrowserToolError('INVALID_OBSERVE_MODE', 'observe mode must be full or delta.');
-    if (request.view !== undefined && !['standard', 'controls'].includes(request.view)) throw new BrowserToolError('INVALID_OBSERVE_VIEW', 'observe view must be standard or controls.');
-  }
+  if (operation === 'observe' || (operation === 'act' && request.observe)) validateObservationOptions(request);
   if (operation === 'batch') {
     if (!Array.isArray(request.steps) || request.steps.length === 0) throw new BrowserToolError('INVALID_BATCH', 'batch steps must be a non-empty array.');
     if (request.steps.length > MAX_BATCH_STEPS) throw new BrowserToolError('BATCH_TOO_LARGE', `batch cannot contain more than ${MAX_BATCH_STEPS} steps.`);
@@ -432,10 +392,9 @@ function validateSessionRequest(request) {
 function getCapabilities() {
   return {
     protocolVersion: PROTOCOL_VERSION,
-    commands: ['capabilities', 'serve', 'session', 'doctor', 'map', 'probe', 'qa', 'interact', 'screenshot', 'diff', 'layout', 'clean', 'presets'],
+    commands: ['capabilities', 'serve', 'doctor', 'map', 'probe', 'qa', 'screenshot', 'diff', 'layout', 'clean', 'presets'],
     sessionOperations: [...SESSION_OPERATIONS],
     agentActions: [...AGENT_ACTIONS],
-    workflowActions: [...WORKFLOW_ACTIONS],
     observeModes: ['full', 'delta'],
     observeViews: ['standard', 'controls'],
     optionalSessionActions: ['evaluate (requires the session to be opened with allowEvaluate: true)'],
@@ -444,7 +403,7 @@ function getCapabilities() {
     features: [
       'request-ids', 'structured-errors', 'bounded-output', 'semantic-locator-fallbacks',
       'diagnostic-filters', 'delta-observations', 'event-subscriptions', 'dom-watchers',
-      'workflow-validation', 'safe-mode', 'session-discovery', 'ref-recovery',
+      'safe-mode', 'session-discovery', 'ref-recovery',
       'batch-operations', 'observation-views', 'tab-management', 'opt-in-session-evaluate',
       'idempotent-close'
     ],
@@ -454,9 +413,6 @@ function getCapabilities() {
       maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
       maxSessions: DEFAULT_MAX_AGENT_SESSIONS,
       idleTimeout: DEFAULT_SESSION_IDLE_TIMEOUT,
-      maxWorkflowSteps: MAX_WORKFLOW_STEPS,
-      maxWorkflowRetries: MAX_WORKFLOW_RETRIES,
-      maxWorkflowFileBytes: MAX_WORKFLOW_FILE_BYTES,
       defaultWatchTimeout: DEFAULT_WATCH_TIMEOUT
     },
     maximumLimits: {
@@ -516,14 +472,6 @@ function normalizeCoalesceMs(value) {
 function appendBounded(collection, value, limit = MAX_SESSION_DIAGNOSTICS) {
   collection.push(value);
   if (collection.length > limit) collection.splice(0, collection.length - limit);
-}
-
-function normalizeTraceMode(value) {
-  if (value === true) return 'on-failure';
-  if (!value || value === false) return 'off';
-  const mode = String(value).toLowerCase();
-  if (!TRACE_MODES.has(mode)) throw new Error(`Unknown trace mode: ${mode}. Expected off, on, or on-failure.`);
-  return mode;
 }
 
 function safeArtifactFilename(value, fallback) {
@@ -605,7 +553,7 @@ async function prepareVisualCapture(page, options = {}) {
   const {
     readySelector = null,
     readyTimeout = DEFAULT_PAGE_READY_TIMEOUT,
-    delay = 0,
+    delay = DEFAULT_SCREENSHOT_DELAY,
     freezeAnimations = true,
     visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT
   } = options;
@@ -688,24 +636,6 @@ function resolveWorkflowUrl(value) {
   if (typeof value !== 'string' || !value.includes('{{cwd}}')) return value;
   const cwdPath = pathToFileURL(process.cwd()).toString().replace(/\/$/, '');
   return value.replaceAll('file://{{cwd}}', cwdPath);
-}
-
-async function readWorkflowFile(filePath) {
-  const resolvedPath = path.resolve(process.cwd(), filePath);
-  const stat = await fs.stat(resolvedPath).catch(() => null);
-  if (!stat || !stat.isFile()) throw new BrowserToolError('WORKFLOW_NOT_FOUND', `Workflow file not found: ${resolvedPath}`);
-  if (stat.size > MAX_WORKFLOW_FILE_BYTES) throw new BrowserToolError('WORKFLOW_TOO_LARGE', `Workflow file cannot exceed ${MAX_WORKFLOW_FILE_BYTES} bytes.`);
-  let content;
-  try {
-    content = await fs.readFile(resolvedPath, 'utf-8');
-  } catch {
-    throw new BrowserToolError('WORKFLOW_READ_FAILED', `Unable to read workflow file: ${resolvedPath}`);
-  }
-  try {
-    return JSON.parse(content);
-  } catch {
-    throw new BrowserToolError('INVALID_WORKFLOW_JSON', `Workflow file is not valid JSON: ${resolvedPath}`);
-  }
 }
 
 async function readLocatorText(locator, redact = false) {
@@ -886,15 +816,6 @@ function printJson(value, maxChars = DEFAULT_MAX_OUTPUT_CHARS) {
   // Agent output must be compact by default. Humans can pipe it through a
   // formatter when needed, while compact output materially reduces context.
   console.log(serializeOutput(value, maxChars));
-}
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }
 
 function sanitizeUrl(value) {
@@ -1527,8 +1448,7 @@ export async function observeAgentSession(options = {}) {
   const page = session.page;
   if (!page || page.isClosed()) throw new Error(`Agent session has no open page: ${session.id}`);
   const mode = options.mode || 'full';
-  if (mode !== 'full' && mode !== 'delta') throw new BrowserToolError('INVALID_OBSERVE_MODE', 'observe mode must be full or delta.');
-  if (options.view !== undefined && !['standard', 'controls'].includes(options.view)) throw new BrowserToolError('INVALID_OBSERVE_VIEW', 'observe view must be standard or controls.');
+  validateObservationOptions(options);
   let requestedSince = null;
   if (options.since !== undefined) {
     requestedSince = Number(options.since);
@@ -1741,6 +1661,7 @@ export async function actAgentSession(options = {}) {
   const session = getAgentSession(options.sessionId);
   const page = session.page;
   if (!page || page.isClosed()) throw new Error(`Agent session has no open page: ${session.id}`);
+  if (options.observe) validateObservationOptions(options);
   const action = requireString(options.action, 'INVALID_ACTION', 'act action');
   const allowedActions = session.allowEvaluate ? new Set([...AGENT_ACTIONS, 'evaluate']) : AGENT_ACTIONS;
   if (!allowedActions.has(action)) {
@@ -1893,16 +1814,21 @@ export async function actAgentSession(options = {}) {
       const requestedOutputPath = path.resolve(process.cwd(), options.outputPath || options.path || `./screenshots/session-${Date.now()}.png`);
       const outputPath = session.safetyMode === 'safe' ? assertPathWithinWorkspace(requestedOutputPath) : requestedOutputPath;
       await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      const delay = options.delay === undefined ? DEFAULT_SCREENSHOT_DELAY : Number(options.delay);
+      const fullPage = options.fullPage !== false;
       await prepareVisualCapture(page, {
         readySelector: options.readySelector || null,
         readyTimeout: options.readyTimeout || DEFAULT_PAGE_READY_TIMEOUT,
-        delay: options.delay === undefined ? 0 : options.delay,
+        delay,
         freezeAnimations: options.freezeAnimations !== false,
         visualStabilityTimeout: options.visualStabilityTimeout || DEFAULT_VISUAL_STABILITY_TIMEOUT
       });
       if (target) await target.screenshot({ path: outputPath });
-      else await page.screenshot({ path: outputPath, fullPage: Boolean(options.fullPage) });
-      actionResult = { screenshotPath: outputPath };
+      else await page.screenshot({ path: outputPath, fullPage });
+      actionResult = {
+        screenshotPath: outputPath,
+        capture: { mode: target ? 'element' : fullPage ? 'full-page' : 'viewport', delayMs: delay }
+      };
       break;
     }
     case 'evaluate': {
@@ -1940,7 +1866,14 @@ export async function actAgentSession(options = {}) {
     ...actionResult,
     diagnostics: takeSessionDiagnostics(session)
   };
-  if (options.observe) result.observation = await observeAgentSession({ sessionId: session.id, maxItems: options.maxItems ?? options['max-items'], maxText: options.maxText ?? options['max-text'] });
+  if (options.observe) result.observation = await observeAgentSession({
+    sessionId: session.id,
+    mode: options.mode,
+    view: options.view,
+    since: options.since,
+    maxItems: options.maxItems ?? options['max-items'],
+    maxText: options.maxText ?? options['max-text']
+  });
   return result;
 }
 
@@ -2386,15 +2319,13 @@ export async function captureResponsiveScreenshots(options) {
     outputFilename = null,
     presets = ['desktop'],
     customSizes = [],
-    fullPage = false,
+    fullPage = true,
     selector = null,
     clip = null,
     hover = null,
-    delay = 0,
+    delay = DEFAULT_SCREENSHOT_DELAY,
     colorScheme = 'no-preference',
     headless = true,
-    recordVideo = false,
-    videoDir = './recordings',
     concurrency = true,
     maxConcurrency = DEFAULT_SCREENSHOT_CONCURRENCY,
     authStatePath = null,
@@ -2427,14 +2358,6 @@ export async function captureResponsiveScreenshots(options) {
     ? assertPathWithinWorkspace(path.resolve(process.cwd(), outputDir))
     : path.resolve(process.cwd(), outputDir);
   await fs.mkdir(resolvedOutputDir, { recursive: true });
-
-  let resolvedVideoDir = null;
-  if (recordVideo) {
-    resolvedVideoDir = normalizedSafetyMode === 'safe'
-      ? assertPathWithinWorkspace(path.resolve(process.cwd(), videoDir))
-      : path.resolve(process.cwd(), videoDir);
-    await fs.mkdir(resolvedVideoDir, { recursive: true });
-  }
 
   const targetConfigs = [];
   const presetList = normalizePresetList(presets, ['desktop']);
@@ -2476,7 +2399,6 @@ export async function captureResponsiveScreenshots(options) {
     };
 
     if (authStatePath) contextOptions.storageState = path.resolve(process.cwd(), authStatePath);
-    if (recordVideo) contextOptions.recordVideo = { dir: resolvedVideoDir, size: config.viewport };
     const parsedGeo = parseGeo(geo);
     if (parsedGeo) { contextOptions.geolocation = parsedGeo; contextOptions.permissions = ['geolocation']; }
     if (timezone) contextOptions.timezoneId = timezone;
@@ -2514,23 +2436,8 @@ export async function captureResponsiveScreenshots(options) {
         await page.screenshot({ path: finalPath, fullPage });
       }
 
-      let recordedVideoPath = null;
-      if (recordVideo && page.video()) {
-        const video = page.video();
-        const videoFinalPath = path.join(resolvedVideoDir, `${sanitizedUrl}-${config.name}${themeSuffix}-${timestamp}.webm`);
-        await page.close();
-        await context.close();
-        const origVideoPath = await video.path();
-        await fs.rename(origVideoPath, videoFinalPath).catch(async () => {
-          await fs.copyFile(origVideoPath, videoFinalPath);
-          await fs.unlink(origVideoPath).catch(() => {});
-        });
-        recordedVideoPath = videoFinalPath;
-      } else {
-        await context.close();
-      }
-
-      return { name: `${config.name}${themeSuffix}`, viewport: config.viewport, path: finalPath, videoPath: recordedVideoPath };
+      await context.close();
+      return { name: `${config.name}${themeSuffix}`, viewport: config.viewport, path: finalPath };
     } catch (err) {
       await context.close().catch(() => {});
       throw err;
@@ -2550,8 +2457,9 @@ export async function captureResponsiveScreenshots(options) {
     return {
       channelUsed,
       totalCaptured: results.length,
-      files: results.map(r => ({ name: r.name, viewport: r.viewport, path: r.path })),
-      videos: results.map(r => r.videoPath).filter(Boolean)
+      captureMode: selector ? 'element' : clip ? 'clip' : fullPage ? 'full-page' : 'viewport',
+      delayMs: Number(delay),
+      files: results.map(r => ({ name: r.name, viewport: r.viewport, path: r.path }))
     };
   } finally {
     if (ownsBrowser) await browser.close();
@@ -2564,12 +2472,10 @@ export async function captureResponsiveScreenshots(options) {
 export async function probeUrl(options) {
   const {
     url,
-    delay = 0,
+    delay = null,
     headless = true,
     takeScreenshot = false,
     outputDir = './screenshots',
-    recordVideo = false,
-    videoDir = './recordings',
     auditA11y = true,
     redact = false,
     authStatePath = null,
@@ -2598,15 +2504,13 @@ export async function probeUrl(options) {
   } = options;
 
   if (!url) throw new Error('URL is required.');
+  const captureDelay = delay === null ? (takeScreenshot ? DEFAULT_SCREENSHOT_DELAY : 0) : Number(delay);
   const targetUrl = resolveWorkflowUrl(url);
   const ignoredUrls = normalizeIgnoreUrls(ignoreUrls);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
   const normalizedAllowedHosts = normalizeAllowedHosts(allowedHosts);
   assertInitialNavigationAllowed(targetUrl, normalizedSafetyMode, normalizedAllowedHosts);
-  if (normalizedSafetyMode === 'safe') {
-    if (takeScreenshot) assertPathWithinWorkspace(path.resolve(process.cwd(), outputDir));
-    if (recordVideo) assertPathWithinWorkspace(path.resolve(process.cwd(), videoDir));
-  }
+  if (normalizedSafetyMode === 'safe' && takeScreenshot) assertPathWithinWorkspace(path.resolve(process.cwd(), outputDir));
 
   const consoleErrors = [];
   const consoleWarnings = [];
@@ -2625,13 +2529,6 @@ export async function probeUrl(options) {
     const parsedGeo = parseGeo(geo);
     if (parsedGeo) { contextOptions.geolocation = parsedGeo; contextOptions.permissions = ['geolocation']; }
     if (timezone) contextOptions.timezoneId = timezone;
-
-    let resolvedVideoDir = null;
-    if (recordVideo) {
-      resolvedVideoDir = path.resolve(process.cwd(), videoDir);
-      await fs.mkdir(resolvedVideoDir, { recursive: true });
-      contextOptions.recordVideo = { dir: resolvedVideoDir, size: viewport };
-    }
 
     context = await browser.newContext(contextOptions);
     const page = await context.newPage();
@@ -2666,8 +2563,8 @@ export async function probeUrl(options) {
     assertFinalNavigationAllowed(page, targetUrl, normalizedSafetyMode, normalizedAllowedHosts);
 
     if (redact) await applyRedaction(page);
-    if (takeScreenshot || hover) await prepareVisualCapture(page, { readySelector, readyTimeout, delay, freezeAnimations, visualStabilityTimeout });
-    else await waitForReadiness(page, { readySelector, readyTimeout, delay });
+    if (takeScreenshot || hover) await prepareVisualCapture(page, { readySelector, readyTimeout, delay: captureDelay, freezeAnimations, visualStabilityTimeout });
+    else await waitForReadiness(page, { readySelector, readyTimeout, delay: captureDelay });
     if (hover) {
       await page.hover(hover).catch(() => {});
       await waitForVisualStability(page, { timeout: visualStabilityTimeout });
@@ -2724,23 +2621,10 @@ export async function probeUrl(options) {
         : path.resolve(process.cwd(), outputDir);
       await fs.mkdir(resolvedDir, { recursive: true });
       screenshotPath = path.join(resolvedDir, `probe-${Date.now()}.png`);
-      await page.screenshot({ path: screenshotPath });
+      await page.screenshot({ path: screenshotPath, fullPage: true });
     }
 
-    let videoPath = null;
-    if (recordVideo && page.video()) {
-      const video = page.video();
-      videoPath = path.join(resolvedVideoDir, `probe-${Date.now()}.webm`);
-      await page.close();
-      await context.close();
-      const origVideo = await video.path();
-      await fs.rename(origVideo, videoPath).catch(async () => {
-        await fs.copyFile(origVideo, videoPath);
-        await fs.unlink(origVideo).catch(() => {});
-      });
-    } else {
-      await context.close();
-    }
+    await context.close();
 
     return {
       url: sanitizeUrl(targetUrl),
@@ -2751,7 +2635,7 @@ export async function probeUrl(options) {
       consoleLogs: { totalErrors: consoleErrors.length, totalWarnings: consoleWarnings.length, errors: consoleErrors, warnings: consoleWarnings },
       network: { totalRequests: requestCount, errors: networkErrors, requestFailures },
       screenshotPath,
-      videoPath
+      ...(screenshotPath ? { screenshotCapture: { mode: 'full-page', delayMs: captureDelay } } : {})
     };
   } finally {
     if (context) await context.close().catch(() => {});
@@ -2760,697 +2644,13 @@ export async function probeUrl(options) {
 }
 
 // ==========================================
-// 7. ADVANCED BEHAVIORAL WORKFLOW RUNNER
-// ==========================================
-export async function runWorkflow(options) {
-  const {
-    steps = [],
-    preset = 'desktop',
-    customViewport = null,
-    headless = true,
-    slowMo = 0,
-    recordVideo = false,
-    saveSnapshots = false,
-    videoDir = './recordings',
-    videoFilename = null,
-    authStatePath = null,
-    saveStatePath = null,
-    network = null,
-    redact = false,
-    waitUntil = 'domcontentloaded',
-    token = null,
-    cookie = null,
-    geo = null,
-    timezone = null,
-    permissions = null,
-    permissionOrigin = null,
-    safetyMode = null,
-    safeMode = false,
-    unsafe = false,
-    allowedHosts = [],
-    ignoreUrls = [],
-    readySelector = null,
-    readyTimeout = DEFAULT_PAGE_READY_TIMEOUT,
-    delay = 0,
-    trace = 'off',
-    traceDir = './traces',
-    retrySideEffects = false,
-    allowSensitiveTrace = false,
-    freezeAnimations = true,
-    visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT,
-    browser: providedBrowser = null,
-    channelUsed: providedChannelUsed = null
-  } = options;
-
-  const retryCounts = validateWorkflowSteps(steps);
-  const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
-  const normalizedAllowedHosts = normalizeAllowedHosts(allowedHosts);
-  const ignoredUrls = normalizeIgnoreUrls(ignoreUrls);
-
-  if (!customViewport && !VIEWPORT_PRESETS[preset]) throw new Error(`Unknown viewport preset: ${preset}`);
-  const deviceConfig = customViewport
-    ? { viewport: validateViewport(customViewport) }
-    : VIEWPORT_PRESETS[preset];
-
-  const traceMode = normalizeTraceMode(trace);
-  if (redact && traceMode !== 'off' && !allowSensitiveTrace) {
-    throw new Error('Tracing with redaction is disabled by default because trace archives can contain raw DOM and network data. Set allowSensitiveTrace=true only for a controlled, confidential run.');
-  }
-  const resolvedTraceDir = path.resolve(process.cwd(), traceDir);
-  const resolvedSaveStatePath = saveStatePath ? path.resolve(process.cwd(), saveStatePath) : null;
-  if (normalizedSafetyMode === 'safe') {
-    if (recordVideo) assertPathWithinWorkspace(path.resolve(process.cwd(), videoDir));
-    if (traceMode !== 'off') assertPathWithinWorkspace(resolvedTraceDir);
-    if (resolvedSaveStatePath) assertPathWithinWorkspace(resolvedSaveStatePath);
-  }
-  const browserInfo = await resolveBrowser({ browser: providedBrowser, channelUsed: providedChannelUsed, headless, slowMo });
-  const { browser, channelUsed, ownsBrowser } = browserInfo;
-
-  const stepResults = [];
-  const behavioralWarnings = [];
-  const consoleErrors = [];
-  const consoleWarnings = [];
-  const networkErrors = [];
-  const requestFailures = [];
-  const extractedData = {};
-  let fatalError = null;
-  const firstHttpNavigationStep = steps.find(step => step && (step.action === 'navigate' || step.action === 'goto') && isHttpUrl(resolveWorkflowUrl(step.url)));
-  const workflowOriginUrl = firstHttpNavigationStep ? resolveWorkflowUrl(firstHttpNavigationStep.url) : null;
-  let navigationOrigin = workflowOriginUrl ? new URL(workflowOriginUrl).origin : null;
-
-  let resolvedVideoDir = null;
-  if (recordVideo) {
-    resolvedVideoDir = normalizedSafetyMode === 'safe'
-      ? assertPathWithinWorkspace(path.resolve(process.cwd(), videoDir))
-      : path.resolve(process.cwd(), videoDir);
-    await fs.mkdir(resolvedVideoDir, { recursive: true });
-  }
-
-  let cleanupContext = null;
-  let cleanupTraceStarted = false;
-  try {
-    const contextOptions = {
-      viewport: deviceConfig.viewport,
-      isMobile: deviceConfig.isMobile,
-      hasTouch: deviceConfig.hasTouch,
-      deviceScaleFactor: deviceConfig.deviceScaleFactor || 1
-    };
-
-    if (authStatePath) contextOptions.storageState = path.resolve(process.cwd(), authStatePath);
-    if (recordVideo) contextOptions.recordVideo = { dir: resolvedVideoDir, size: deviceConfig.viewport };
-    const parsedGeo = parseGeo(geo);
-    if (parsedGeo) { contextOptions.geolocation = parsedGeo; contextOptions.permissions = ['geolocation']; }
-    if (timezone) contextOptions.timezoneId = timezone;
-
-    const context = await browser.newContext(contextOptions);
-    cleanupContext = context;
-    let activePage = await context.newPage();
-    if (permissions) {
-      await context.grantPermissions(normalizePermissionList(permissions), {
-        origin: resolvePermissionOrigin(permissionOrigin || workflowOriginUrl)
-      });
-    }
-    await configureContextFeatures(context, activePage, { network, redact, token, cookie, url: workflowOriginUrl });
-
-    let traceStarted = false;
-    let tracePath = null;
-    let traceError = null;
-    if (traceMode !== 'off') {
-      await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
-      traceStarted = true;
-      cleanupTraceStarted = true;
-    }
-
-    const attachWorkflowDiagnostics = (page) => {
-      page.on('framenavigated', frame => {
-        if (frame !== page.mainFrame()) return;
-        try {
-          assertNavigationAllowed(frame.url(), navigationOrigin, normalizedSafetyMode, normalizedAllowedHosts);
-          if (!navigationOrigin && isHttpUrl(frame.url())) navigationOrigin = new URL(frame.url()).origin;
-        } catch (error) {
-          appendBounded(consoleErrors, { type: 'navigation-blocked', code: errorCode(error), text: errorMessage(error), url: sanitizeUrl(frame.url()) });
-          void page.close().catch(() => {});
-        }
-      });
-      page.on('console', (msg) => {
-        if (shouldIgnoreUrl(page.url(), ignoredUrls)) return;
-        const diagnostic = { type: msg.type(), text: redactSensitiveText(msg.text()).slice(0, 300), url: sanitizeUrl(page.url()) };
-        if (msg.type() === 'error') appendBounded(consoleErrors, diagnostic);
-        else if (isConsoleWarningType(msg.type())) appendBounded(consoleWarnings, diagnostic);
-      });
-      page.on('pageerror', (err) => {
-        if (shouldIgnoreUrl(page.url(), ignoredUrls)) return;
-        appendBounded(consoleErrors, { type: 'uncaught-exception', text: redactSensitiveText(err.message).slice(0, 300), url: sanitizeUrl(page.url()) });
-      });
-      page.on('response', (res) => {
-        if (shouldIgnoreUrl(res.url(), ignoredUrls)) return;
-        if (res.status() >= 400) appendBounded(networkErrors, { method: res.request().method(), resourceType: res.request().resourceType(), url: sanitizeUrl(res.url()), status: res.status() });
-      });
-      page.on('requestfailed', request => {
-        if (shouldIgnoreUrl(request.url(), ignoredUrls)) return;
-        appendBounded(requestFailures, { method: request.method(), resourceType: request.resourceType(), url: sanitizeUrl(request.url()), failure: redactSensitiveText(request.failure()?.errorText || 'request failed').slice(0, 300) });
-      });
-      if (redact) page.on('framenavigated', frame => {
-        if (frame === page.mainFrame()) void applyRedaction(page);
-      });
-    };
-    attachWorkflowDiagnostics(activePage);
-
-    context.on('page', (newPage) => {
-      void (async () => {
-        activePage = newPage;
-        attachWorkflowDiagnostics(newPage);
-        await newPage.waitForLoadState().catch(() => {});
-        await configureContextFeatures(context, newPage, { network, redact, token, cookie, url: workflowOriginUrl });
-        if (redact) await applyRedaction(newPage);
-      })().catch(err => {
-        appendBounded(consoleErrors, { type: 'browser-tool-error', text: errorMessage(err).slice(0, 300), url: sanitizeUrl(newPage.url()) });
-      });
-    });
-
-    let pendingDialog = null;
-    let pendingDialogStep = null;
-    let pendingDialogSoft = false;
-    for (let i = 0; i < steps.length; i++) {
-      if (fatalError) break;
-      const step = steps[i];
-      const index = i + 1;
-      const { action, soft = false, optional = false, description = '', frame = null, ...args } = step;
-      const retries = retryCounts[i];
-      const isSoft = soft || optional;
-
-      let attempt = 0;
-      let lastError = null;
-      let stepPassed = false;
-
-      while (attempt <= retries && !stepPassed) {
-        attempt++;
-        let dialogAttempt = null;
-        try {
-          if (pendingDialog && action === 'dialog') {
-            if (pendingDialog.required !== false) {
-              throw new Error(`Dialog step ${pendingDialogStep} must be followed by the action that opens the dialog.`);
-            }
-            pendingDialog = null;
-            pendingDialogStep = null;
-            pendingDialogSoft = false;
-          }
-          if (pendingDialog && action !== 'dialog') dialogAttempt = armDialogHandler(activePage, pendingDialog);
-          const target = resolveTargetScope(activePage, frame);
-
-          switch (action) {
-            case 'navigate':
-            case 'goto':
-              {
-                const nextUrl = resolveWorkflowUrl(args.url);
-                assertNavigationAllowed(nextUrl, navigationOrigin, normalizedSafetyMode, normalizedAllowedHosts);
-                await activePage.goto(nextUrl, { waitUntil: args.waitUntil || waitUntil, timeout: Number(args.timeout) || 35000 });
-                if (!navigationOrigin && isHttpUrl(nextUrl)) navigationOrigin = new URL(nextUrl).origin;
-              }
-              if (redact) await applyRedaction(activePage);
-              await waitForReadiness(activePage, {
-                readySelector: args.readySelector || readySelector,
-                readyTimeout: args.readyTimeout || readyTimeout,
-                delay: args.delay === undefined ? delay : args.delay
-              });
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'upload':
-            case 'setInputFiles': {
-              const fileList = Array.isArray(args.files) ? args.files : [args.files || args.file || args.path];
-              const resolvedFiles = fileList.map(f => {
-                const resolved = path.resolve(process.cwd(), f);
-                return normalizedSafetyMode === 'safe' ? assertPathWithinWorkspace(resolved) : resolved;
-              });
-              await target.locator(args.selector).setInputFiles(resolvedFiles);
-              stepResults.push({ step: index, action, status: 'ok', description: `Uploaded ${resolvedFiles.length} file(s)` });
-              stepPassed = true;
-              break;
-            }
-
-            case 'dragAndDrop':
-            case 'drag': {
-              const dragOpts = { timeout: args.timeout || 8000 };
-              if (args.sourcePosition) dragOpts.sourcePosition = args.sourcePosition;
-              if (args.targetPosition) dragOpts.targetPosition = args.targetPosition;
-              if (frame) await target.locator(args.source || args.from).dragTo(target.locator(args.target || args.to), dragOpts);
-              else await activePage.dragAndDrop(args.source || args.from, args.target || args.to, dragOpts);
-              stepResults.push({ step: index, action, status: 'ok', description: `Dragged ${args.source} to ${args.target}` });
-              stepPassed = true;
-              break;
-            }
-
-            case 'switchTab': {
-              const pages = context.pages();
-              const tabIdx = args.index ?? (pages.length - 1);
-              if (!pages[tabIdx]) throw new Error(`Tab index ${tabIdx} does not exist; ${pages.length} tab(s) open.`);
-              activePage = pages[tabIdx];
-              await activePage.bringToFront();
-              stepResults.push({ step: index, action, status: 'ok', description: `Switched to tab ${tabIdx}` });
-              stepPassed = true;
-              break;
-            }
-
-            case 'mockRoute':
-            case 'mockApi': {
-              const routePattern = args.url || args.pattern || '**/*';
-              await activePage.route(routePattern, async (route) => {
-                if (args.abort) {
-                  await route.abort();
-                } else {
-                  if (args.delay) await new Promise(r => setTimeout(r, args.delay));
-                  await route.fulfill({
-                    status: args.status || 200,
-                    contentType: args.contentType || 'application/json',
-                    body: typeof args.body === 'object' ? JSON.stringify(args.body) : String(args.body || '{}'),
-                    headers: args.headers || {}
-                  });
-                }
-              });
-              stepResults.push({ step: index, action, status: 'ok', description: `Mocked ${routePattern}` });
-              stepPassed = true;
-              break;
-            }
-
-            case 'saveState': {
-              const requestedPath = path.resolve(process.cwd(), args.path || saveStatePath || './auth.json');
-              const targetPath = normalizedSafetyMode === 'safe' ? assertPathWithinWorkspace(requestedPath) : requestedPath;
-              await fs.mkdir(path.dirname(targetPath), { recursive: true });
-              await context.storageState({ path: targetPath });
-              stepResults.push({ step: index, action, status: 'ok', description: `Saved auth state to ${targetPath}` });
-              stepPassed = true;
-              break;
-            }
-
-            case 'dialog': {
-              pendingDialog = normalizeDialogSpec(args.dialog ?? {
-                type: args.type || args.disposition || 'accept',
-                promptText: args.promptText ?? args.text,
-                required: args.required
-              });
-              pendingDialogStep = index;
-              pendingDialogSoft = isSoft;
-              stepResults.push({ step: index, action, status: 'ok', description, dialog: pendingDialog.type });
-              stepPassed = true;
-              break;
-            }
-
-            case 'download': {
-              const downloadPath = await downloadFromSelector(activePage, frame ? target : null, { ...args, safeMode: normalizedSafetyMode === 'safe' });
-              stepResults.push({ step: index, action, status: 'ok', description, downloadPath });
-              stepPassed = true;
-              break;
-            }
-
-            case 'permissions': {
-              if (args.clear) {
-                await context.clearPermissions();
-                stepResults.push({ step: index, action, status: 'ok', description, permissions: [] });
-              } else {
-                const granted = normalizePermissionList(args.permissions || args.permission);
-                const origin = resolvePermissionOrigin(args.origin || workflowOriginUrl || activePage.url());
-                assertNavigationAllowed(origin, navigationOrigin, normalizedSafetyMode, normalizedAllowedHosts);
-                await context.grantPermissions(granted, { origin });
-                stepResults.push({ step: index, action, status: 'ok', description, permissions: granted, permissionOrigin: origin });
-              }
-              stepPassed = true;
-              break;
-            }
-
-            case 'click': {
-              const clickOpts = { timeout: args.timeout || 8000, force: Boolean(args.force) };
-              if (args.position || (args.x !== undefined && args.y !== undefined)) {
-                clickOpts.position = args.position || { x: Number(args.x), y: Number(args.y) };
-              }
-              if (frame) {
-                await target.locator(args.selector).click(clickOpts);
-              } else {
-                await activePage.click(args.selector, clickOpts);
-              }
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-            }
-
-            case 'fill':
-              if (frame) {
-                if (args.clear !== false) await target.locator(args.selector).fill('');
-                await target.locator(args.selector).fill(String(args.text ?? args.value ?? ''));
-              } else {
-                if (args.clear !== false) await activePage.fill(args.selector, '');
-                if (args.delay) await activePage.type(args.selector, String(args.text ?? args.value ?? ''), { delay: args.delay });
-                else await activePage.fill(args.selector, String(args.text ?? args.value ?? ''));
-              }
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'type':
-              if (frame) {
-                const locator = target.locator(args.selector);
-                if (args.clear !== false) await locator.fill('');
-                await locator.pressSequentially(String(args.text ?? args.value ?? ''), { delay: Number(args.delay) || 0, timeout: Number(args.timeout) || 8000 });
-              } else {
-                if (args.clear !== false) await activePage.fill(args.selector, '');
-                await activePage.locator(args.selector).pressSequentially(String(args.text ?? args.value ?? ''), { delay: Number(args.delay) || 0, timeout: Number(args.timeout) || 8000 });
-              }
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'check':
-              if (frame) await target.locator(args.selector).check();
-              else await activePage.check(args.selector);
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'uncheck':
-              if (frame) await target.locator(args.selector).uncheck();
-              else await activePage.uncheck(args.selector);
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'select':
-            case 'selectOption':
-              {
-                const selectValue = selectOptionDescriptor(args);
-                if (frame) await target.locator(args.selector).selectOption(selectValue);
-                else await activePage.selectOption(args.selector, selectValue);
-              }
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'press':
-              if (frame) await target.locator(args.selector || 'body').press(args.key || 'Enter');
-              else if (args.selector) await activePage.locator(args.selector).press(args.key || 'Enter');
-              else await activePage.keyboard.press(args.key || 'Enter');
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'hover':
-              if (frame) await target.locator(args.selector).hover();
-              else await activePage.hover(args.selector);
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'scroll':
-              if (args.selector && frame) await target.locator(args.selector).scrollIntoViewIfNeeded();
-              else if (args.selector) await activePage.locator(args.selector).scrollIntoViewIfNeeded();
-              else if (args.position === 'bottom') await activePage.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-              else if (args.position === 'top') await activePage.evaluate(() => window.scrollTo(0, 0));
-              else await activePage.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'wait':
-              if (args.selector) {
-                if (frame) await target.locator(args.selector).waitFor({ state: args.state || 'visible', timeout: args.timeout || 8000 });
-                else await activePage.waitForSelector(args.selector, { state: args.state || 'visible', timeout: args.timeout || 8000 });
-              } else if (args.url) {
-                await activePage.waitForURL(args.url, { timeout: args.timeout || 8000 });
-              } else {
-                await activePage.waitForTimeout(args.ms || args.time || 500);
-              }
-              stepResults.push({ step: index, action, status: 'ok', description });
-              stepPassed = true;
-              break;
-
-            case 'assert': {
-              const timeout = args.timeout || 5000;
-              let text;
-              if (frame) {
-                const locator = target.locator(args.selector);
-                await locator.waitFor({ timeout });
-                text = await readLocatorText(locator, redact);
-              } else {
-                const locator = activePage.locator(args.selector);
-                await locator.waitFor({ timeout });
-                text = await readLocatorText(locator, redact);
-              }
-
-              if (args.containsText && !text.includes(args.containsText)) {
-                throw new Error(`Text mismatch: expected "${args.containsText}", found "${text}"`);
-              }
-              if (args.equalsText && text !== args.equalsText) {
-                throw new Error(`Text mismatch: expected "${args.equalsText}", found "${text}"`);
-              }
-              stepResults.push({ step: index, action, status: 'ok', description, verifiedText: text });
-              stepPassed = true;
-              break;
-            }
-
-            case 'scrape':
-            case 'getText': {
-              let text;
-              if (frame) {
-                text = await readLocatorText(target.locator(args.selector), redact);
-              } else {
-                const locator = activePage.locator(args.selector);
-                await locator.waitFor({ state: 'attached', timeout: args.timeout || 6000 });
-                text = await readLocatorText(locator, redact);
-              }
-              const key = args.saveAs || `data_step_${index}`;
-              extractedData[key] = compactValue(text || '', 2000);
-              stepResults.push({ step: index, action, status: 'ok', description, text: compactValue(text || '', 500) });
-              stepPassed = true;
-              break;
-            }
-
-            case 'screenshot': {
-              const requestedOutPath = path.resolve(process.cwd(), args.outputPath || args.path || `./screenshots/step-${index}-${Date.now()}.png`);
-              const outPath = normalizedSafetyMode === 'safe' ? assertPathWithinWorkspace(requestedOutPath) : requestedOutPath;
-              await fs.mkdir(path.dirname(outPath), { recursive: true });
-              await prepareVisualCapture(activePage, {
-                readySelector: args.readySelector || readySelector,
-                readyTimeout: args.readyTimeout || readyTimeout,
-                delay: args.delay === undefined ? 0 : args.delay,
-                freezeAnimations: args.freezeAnimations === undefined ? freezeAnimations : Boolean(args.freezeAnimations),
-                visualStabilityTimeout: args.visualStabilityTimeout || visualStabilityTimeout
-              });
-              if (args.selector) {
-                if (frame) await target.locator(args.selector).screenshot({ path: outPath, timeout: Number(args.timeout) || 10000 });
-                else {
-                  const el = await activePage.waitForSelector(args.selector, { timeout: Number(args.timeout) || 10000 });
-                  await el.screenshot({ path: outPath });
-                }
-              } else if (args.clip) {
-                await activePage.screenshot({ path: outPath, clip: parseClip(args.clip) });
-              } else {
-                await activePage.screenshot({ path: outPath, fullPage: Boolean(args.fullPage) });
-              }
-              stepResults.push({ step: index, action, status: 'ok', description, screenshotPath: outPath });
-              stepPassed = true;
-              break;
-            }
-
-            case 'evaluate': {
-              if (normalizedSafetyMode === 'safe') throw new BrowserToolError('UNSAFE_ACTION', 'evaluate is disabled in safetyMode=safe. Use safetyMode=standard only for trusted workflows.');
-              let res;
-              if (frame) {
-                res = await target.locator('body').evaluate((element, payload) => {
-                  if (payload.fn) return Function(`return (${payload.fn})`)()(element, payload.arg);
-                  if (payload.script) return Function(payload.script)(element, payload.arg);
-                  throw new Error('evaluate requires fn or script.');
-                }, { fn: typeof args.fn === 'string' ? args.fn : null, script: typeof args.script === 'string' ? args.script : null, arg: args.arg });
-              } else if (typeof args.fn === 'function') {
-                res = await activePage.evaluate(args.fn, args.arg);
-              } else if (typeof args.fn === 'string') {
-                res = await activePage.evaluate(({ source, arg }) => Function(`return (${source})`)()(arg), { source: args.fn, arg: args.arg });
-              } else if (typeof args.script === 'string') {
-                res = await activePage.evaluate(args.script);
-              } else {
-                throw new Error('evaluate requires fn or script.');
-              }
-              stepResults.push({ step: index, action, status: 'ok', description, result: compactValue(res) });
-              stepPassed = true;
-              break;
-            }
-
-            default:
-              throw new Error(`Unsupported action: "${action}"`);
-          }
-          if (dialogAttempt) {
-            await dialogAttempt.finish();
-            pendingDialog = null;
-            pendingDialogStep = null;
-            pendingDialogSoft = false;
-          }
-        } catch (err) {
-          if (dialogAttempt) await dialogAttempt.finish().catch(() => {});
-          lastError = err;
-          const canRetry = attempt <= retries && (retrySideEffects || !NON_IDEMPOTENT_WORKFLOW_ACTIONS.has(action));
-          if (canRetry) await activePage.waitForTimeout(300);
-          else break;
-        }
-      }
-
-      if (!stepPassed) {
-        const stepError = lastError || new Error(`Step ${index} failed without an error.`);
-        let snapshotPath = null;
-        if (saveSnapshots) {
-          const requestedSnapshotPath = path.resolve(process.cwd(), `./screenshots/warning-step-${index}-${Date.now()}.png`);
-          snapshotPath = normalizedSafetyMode === 'safe'
-            ? assertPathWithinWorkspace(requestedSnapshotPath)
-            : requestedSnapshotPath;
-          await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
-          await prepareVisualCapture(activePage, { freezeAnimations, visualStabilityTimeout }).catch(() => {});
-          await activePage.screenshot({ path: snapshotPath }).catch(() => {});
-        }
-
-        if (isSoft) {
-          const warningInfo = {
-            step: index,
-            action,
-            description: description || `Soft check step ${index}`,
-            code: errorCode(stepError),
-            error: errorMessage(stepError),
-            snapshot: snapshotPath
-          };
-          behavioralWarnings.push(warningInfo);
-          stepResults.push({ step: index, action, status: 'warning', ...warningInfo });
-        } else {
-          stepResults.push({ step: index, action, status: 'error', code: errorCode(stepError), error: errorMessage(stepError), description, snapshot: snapshotPath });
-          fatalError = stepError;
-          break;
-        }
-      }
-    }
-
-    if (pendingDialog && !fatalError && pendingDialog.required !== false) {
-      const pendingDialogError = new Error(`Expected a ${pendingDialog.type} dialog after step ${pendingDialogStep}, but the workflow ended before an action opened it.`);
-      const pendingDialogResult = stepResults.find(result => result.step === pendingDialogStep && result.action === 'dialog' && result.status === 'ok');
-      if (pendingDialogResult) {
-        pendingDialogResult.status = pendingDialogSoft ? 'warning' : 'error';
-        pendingDialogResult.code = errorCode(pendingDialogError);
-        pendingDialogResult.error = errorMessage(pendingDialogError);
-      }
-      if (pendingDialogSoft) {
-        behavioralWarnings.push({
-          step: pendingDialogStep,
-          action: 'dialog',
-          description: `Expected a ${pendingDialog.type} dialog`,
-          code: errorCode(pendingDialogError),
-          error: errorMessage(pendingDialogError)
-        });
-      } else {
-        fatalError = pendingDialogError;
-      }
-      pendingDialog = null;
-      pendingDialogStep = null;
-      pendingDialogSoft = false;
-    } else if (pendingDialog && !fatalError) {
-      pendingDialog = null;
-      pendingDialogStep = null;
-      pendingDialogSoft = false;
-    }
-
-    const workflowStatus = fatalError ? 'failed' : behavioralWarnings.length > 0 ? 'warning' : 'passed';
-    if (traceStarted) {
-      const shouldSaveTrace = traceMode === 'on' || workflowStatus !== 'passed';
-      try {
-        if (shouldSaveTrace) {
-          await fs.mkdir(resolvedTraceDir, { recursive: true });
-          tracePath = path.join(resolvedTraceDir, `workflow-${Date.now()}.zip`);
-          await context.tracing.stop({ path: tracePath });
-        } else {
-          await context.tracing.stop();
-        }
-      } catch (err) {
-        traceError = errorMessage(err);
-      } finally {
-        cleanupTraceStarted = false;
-      }
-    }
-
-    if (saveStatePath) {
-      const targetState = normalizedSafetyMode === 'safe'
-        ? assertPathWithinWorkspace(resolvedSaveStatePath)
-        : resolvedSaveStatePath;
-      await fs.mkdir(path.dirname(targetState), { recursive: true });
-      await context.storageState({ path: targetState });
-    }
-
-    let finalVideoPath = null;
-    const finalVideoPaths = [];
-    if (recordVideo) {
-      const pageVideos = context.pages()
-        .map((page, index) => ({ page, index, video: page.video() }))
-        .filter(item => item.video);
-      const configuredVideoName = safeArtifactFilename(videoFilename, `workflow-${Date.now()}.webm`);
-      const configuredExtension = path.extname(configuredVideoName) || '.webm';
-      const configuredStem = path.basename(configuredVideoName, path.extname(configuredVideoName));
-      for (const item of pageVideos) await item.page.close().catch(() => {});
-      await context.close();
-      cleanupContext = null;
-      for (const item of pageVideos) {
-        const originalVideoPath = await item.video.path();
-        const filename = pageVideos.length === 1
-          ? configuredVideoName
-          : `${configuredStem}-tab-${item.index + 1}${configuredExtension}`;
-        const destination = path.join(resolvedVideoDir, filename);
-        await fs.rename(originalVideoPath, destination).catch(async () => {
-          await fs.copyFile(originalVideoPath, destination);
-          await fs.unlink(originalVideoPath).catch(() => {});
-        });
-        finalVideoPaths.push(destination);
-      }
-      finalVideoPath = finalVideoPaths[0] || null;
-    } else {
-      await context.close();
-      cleanupContext = null;
-    }
-
-    return {
-      status: workflowStatus,
-      channelUsed,
-      safetyMode: normalizedSafetyMode,
-      totalSteps: steps.length,
-      passedSteps: stepResults.filter(s => s.status === 'ok').length,
-      stepResults,
-      errorCode: fatalError ? errorCode(fatalError) : undefined,
-      error: fatalError ? errorMessage(fatalError) : undefined,
-      behavioralWarnings: behavioralWarnings.length > 0 ? behavioralWarnings : undefined,
-      liveDiagnostics: {
-        consoleErrors: consoleErrors.length > 0 ? consoleErrors : undefined,
-        consoleWarnings: consoleWarnings.length > 0 ? consoleWarnings : undefined,
-        networkErrors: networkErrors.length > 0 ? networkErrors : undefined,
-        requestFailures: requestFailures.length > 0 ? requestFailures : undefined
-      },
-      extractedData: Object.keys(extractedData).length > 0 ? extractedData : undefined,
-      videoPath: finalVideoPath || undefined,
-      videoPaths: finalVideoPaths.length > 0 ? finalVideoPaths : undefined,
-      tracePath: tracePath || undefined,
-      traceError: traceError || undefined
-    };
-  } finally {
-    if (cleanupTraceStarted && cleanupContext) {
-      try {
-        await fs.mkdir(resolvedTraceDir, { recursive: true });
-        await cleanupContext.tracing.stop({ path: path.join(resolvedTraceDir, `workflow-error-${Date.now()}.zip`) });
-      } catch {}
-    }
-    if (cleanupContext) await cleanupContext.close().catch(() => {});
-    if (ownsBrowser) await browser.close();
-  }
-}
-
-// ==========================================
-// 8. FULL QA & STANDALONE HTML REPORT
+// 7. FULL QA
 // ==========================================
 export async function runFullQA(options = {}) {
   const {
     frontendUrl = 'http://localhost:5173',
     mode = 'standard',
     presets = null,
-    testWorkflow = null,
     headless = true,
     authStatePath = null,
     network = null,
@@ -3476,9 +2676,6 @@ export async function runFullQA(options = {}) {
     readySelector = null,
     readyTimeout = DEFAULT_PAGE_READY_TIMEOUT,
     maxConcurrency = DEFAULT_SCREENSHOT_CONCURRENCY,
-    trace = 'off',
-    traceDir = './traces',
-    allowSensitiveTrace = false,
     freezeAnimations = true,
     visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT
   } = options;
@@ -3490,7 +2687,7 @@ export async function runFullQA(options = {}) {
   const layoutEnabled = checkLayout === null
     ? (mode !== 'smoke' || selectedPresets.some(name => ['mobile', 'mobile-small', 'tablet', 'tablet-landscape'].includes(name)))
     : Boolean(checkLayout);
-  const qaStepCount = 2 + (layoutEnabled ? 1 : 0) + (testWorkflow ? 1 : 0);
+  const qaStepCount = 2 + (layoutEnabled ? 1 : 0);
   const a11yIssueLimit = normalizeNonNegativeInteger(maxA11yIssues, 'maxA11yIssues');
   const networkErrorLimit = normalizeNonNegativeInteger(maxNetworkErrors, 'maxNetworkErrors');
   const consoleErrorLimit = normalizeNonNegativeInteger(maxConsoleErrors, 'maxConsoleErrors');
@@ -3536,13 +2733,11 @@ export async function runFullQA(options = {}) {
         browser: { healthy: false, reason },
         probe: { healthy: false, reason },
         responsive: { healthy: false, reason },
-        layout: layoutEnabled ? { healthy: false, reason } : { healthy: true, skipped: true },
-        workflow: testWorkflow ? false : true
+        layout: layoutEnabled ? { healthy: false, reason } : { healthy: true, skipped: true }
       },
       probe: { error: reason },
       responsive: { error: reason },
-      layout: layoutEnabled ? { error: reason } : null,
-      workflow: testWorkflow ? { error: reason } : null
+      layout: layoutEnabled ? { error: reason } : null
     };
     return preflightFailure;
   }
@@ -3593,7 +2788,7 @@ export async function runFullQA(options = {}) {
       browser: sharedBrowserInfo.browser,
       channelUsed: sharedBrowserInfo.channelUsed,
       presets: selectedPresets,
-      delay: 0,
+      delay: DEFAULT_SCREENSHOT_DELAY,
 
       maxConcurrency,
       authStatePath,
@@ -3651,44 +2846,6 @@ export async function runFullQA(options = {}) {
     }
   }
 
-  let workflowResult = null;
-  if (testWorkflow) {
-    log(`[QA Step ${layoutEnabled ? 4 : 3}/${qaStepCount}] Running Behavioral Flow (${testWorkflow})...`);
-    try {
-      const wf = await readWorkflowFile(testWorkflow);
-      workflowResult = await runWorkflow({
-        ...wf,
-        headless,
-        browser: sharedBrowserInfo.browser,
-        channelUsed: sharedBrowserInfo.channelUsed,
-        authStatePath,
-
-        network,
-        waitUntil,
-        token,
-        cookie,
-        geo,
-        timezone,
-        redact: redact || Boolean(wf.redact),
-        safetyMode: normalizedSafetyMode,
-        allowedHosts: normalizedAllowedHosts,
-        ignoreUrls: normalizedIgnoreUrls,
-        readySelector,
-        readyTimeout,
-        delay: 0,
-        trace: trace === 'off' ? (wf.trace || 'off') : trace,
-        traceDir: traceDir === './traces' ? (wf.traceDir || traceDir) : traceDir,
-        allowSensitiveTrace: allowSensitiveTrace || Boolean(wf.allowSensitiveTrace),
-        freezeAnimations: freezeAnimations && wf.freezeAnimations !== false,
-        visualStabilityTimeout
-      });
-      log(`  -> Flow Status: ${workflowResult.status.toUpperCase()} (${workflowResult.passedSteps}/${workflowResult.totalSteps} steps passed)`);
-    } catch (err) {
-      workflowResult = { error: errorMessage(err) };
-      logError(`  -> Flow Failed: ${errorMessage(err)}`);
-    }
-  }
-
   const probeQuality = probeResult.error ? {
     healthy: false,
     reason: probeResult.error
@@ -3717,35 +2874,24 @@ export async function runFullQA(options = {}) {
           smallTapTargets: layoutResult?.smallTapTargetsCount || 0,
           smallTapTargetsEnforced: smallTapTargetLimit !== null
         };
-  const workflowConsoleErrors = workflowResult?.liveDiagnostics?.consoleErrors?.length || 0;
-  const workflowNetworkErrors = (workflowResult?.liveDiagnostics?.networkErrors?.length || 0)
-    + (workflowResult?.liveDiagnostics?.requestFailures?.length || 0);
-  const workflowQuality = !workflowResult || (
-    !workflowResult.error
-    && workflowResult.status === 'passed'
-    && workflowConsoleErrors <= consoleErrorLimit
-    && workflowNetworkErrors <= networkErrorLimit
-  );
-  const overallPassed = probeQuality.healthy && responsiveQuality.healthy && layoutQuality.healthy && workflowQuality;
+  const overallPassed = probeQuality.healthy && responsiveQuality.healthy && layoutQuality.healthy;
 
   log(`\n================ QA SCORECARD ================`);
   log(`Overall Result: ${overallPassed ? 'PASSED ✅' : 'ATTENTION NEEDED ⚠️'}`);
   log(`Frontend Health: ${probeQuality.healthy ? 'OK (Status ' + probeResult.httpStatus + ')' : 'FAILED ❌'}`);
   log(`Responsive Rendering: ${responsiveQuality.healthy ? 'OK (' + responsiveResult.totalCaptured + ' viewports)' : 'FAILED ❌'}`);
   if (layoutEnabled) log(`Mobile Layout: ${layoutQuality.healthy ? 'OK' : 'FAILED ❌'}`);
-  if (workflowResult) log(`Behavioral Flow: ${workflowResult.error ? 'FAILED ❌' : workflowResult.status.toUpperCase()}`);
-
-  return { passed: overallPassed, browser: browserCheck, mode, presets: selectedPresets, quality: { browser: { healthy: true, channelUsed: browserCheck.channelUsed }, probe: probeQuality, responsive: responsiveQuality, layout: layoutQuality, workflow: workflowQuality }, probe: probeResult, responsive: responsiveResult, layout: layoutResult, workflow: workflowResult };
+  return { passed: overallPassed, browser: browserCheck, mode, presets: selectedPresets, quality: { browser: { healthy: true, channelUsed: browserCheck.channelUsed }, probe: probeQuality, responsive: responsiveQuality, layout: layoutQuality }, probe: probeResult, responsive: responsiveResult, layout: layoutResult };
   } finally {
     await sharedBrowserInfo.browser.close().catch(() => {});
   }
 }
 
 // ==========================================
-// 9. VISUAL DIFF
+// 8. VISUAL DIFF
 // ==========================================
 export async function compareVisualDiff(options) {
-  const { url, baselinePath, threshold = 0.05, outputDiffPath = './screenshots/visual-diff.png', headless = true, waitUntil = 'domcontentloaded', authStatePath = null, token = null, cookie = null, redact = false, preset = 'desktop', customViewport = null, network = null, geo = null, timezone = null, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = 0, freezeAnimations = true, visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT, browser: providedBrowser = null, channelUsed: providedChannelUsed = null } = options;
+  const { url, baselinePath, threshold = 0.05, outputDiffPath = './screenshots/visual-diff.png', headless = true, waitUntil = 'domcontentloaded', authStatePath = null, token = null, cookie = null, redact = false, preset = 'desktop', customViewport = null, network = null, geo = null, timezone = null, safetyMode = null, safeMode = false, unsafe = false, allowedHosts = [], readySelector = null, readyTimeout = DEFAULT_PAGE_READY_TIMEOUT, delay = DEFAULT_SCREENSHOT_DELAY, freezeAnimations = true, visualStabilityTimeout = DEFAULT_VISUAL_STABILITY_TIMEOUT, browser: providedBrowser = null, channelUsed: providedChannelUsed = null } = options;
   if (!url || !baselinePath) throw new Error('URL and --baseline path required.');
   const targetUrl = resolveWorkflowUrl(url);
   const normalizedSafetyMode = normalizeSafetyMode({ safetyMode, safeMode, unsafe });
@@ -3868,9 +3014,9 @@ export async function compareVisualDiff(options) {
 }
 
 export async function cleanArtifacts(options = {}) {
-  const dirs = ['./screenshots', './recordings', './traces'];
+  const dirs = ['./screenshots'];
   const force = Boolean(options.force);
-  const toolFile = /^(probe|component|visual-diff|step-|warning-step-|workflow-|behavioral-|https?_|file_|localhost|127_|session-)/i;
+  const toolFile = /^(probe|visual-diff|https?_|file_|localhost|127_|session-)/i;
   let removedCount = 0;
   const skipped = [];
   for (const d of dirs) {
@@ -3907,7 +3053,7 @@ export async function cleanArtifacts(options = {}) {
 }
 
 // ==========================================
-// 10. CLI PARSER & RUNNER
+// 9. CLI PARSER & RUNNER
 // ==========================================
 function parseCliArgs(args) {
   const options = {};
@@ -3949,12 +3095,11 @@ Browser Tool — bounded browser automation for agents
 
 COMMANDS:
   capabilities [--json]         Show protocol, actions, events, and limits without launching a browser
-  serve | session               Keep browser sessions alive over JSONL stdin/stdout
+  serve                         Keep browser sessions alive over JSONL stdin/stdout
   doctor                       Verify the bundled browser launches
-  map <url> [options]           One-shot bounded semantic map with stable refs
+  map <url> [options]           One-shot bounded semantic map with observation-scoped refs
   probe <url> [options]         Health, console, network, and accessibility checks
-  qa <url> [options]            Probe + responsive captures + optional workflow
-  interact <workflow.json>      Execute a repeatable multi-step browser flow
+  qa <url> [options]            Probe + responsive captures + optional mobile layout
   screenshot <url> [options]    Capture responsive visual evidence
   diff <url> [options]          Compare a render against a PNG baseline
   layout <url> [options]        Check mobile overflow and small tap targets
@@ -3964,18 +3109,17 @@ COMMANDS:
 COMMON OPTIONS:
   --json                        Compact JSON output for agent ingestion
   --auth=<path>                 Reuse saved cookies/localStorage state
-  --save-state=<path>           Save workflow browser state
   --token=<value>               Scope Authorization to the target origin
   --cookie=<str>                Add cookies for the target URL
   --network=<profile>           Throttle: slow-3g, fast-3g, or offline
   --geo=<lat,lng>               Simulate geolocation
   --timezone=<id>               Simulate timezone
-  --permissions=<list>          Grant permissions such as geolocation (workflow/session)
+  --permissions=<list>          Grant permissions such as geolocation (session)
   --permission-origin=<url>     Scope explicit permission grants to one HTTP origin
   --redact                      Hide sensitive fields in visual artifacts
   --wait-until=<state>          domcontentloaded (default), load, or networkidle
   --ready=<css>                 Wait for a visible readiness selector before capture/probe
-  --delay=<ms>                  Optional explicit delay after readiness (default: 0)
+  --delay=<ms>                  Post-readiness delay (screenshots: 250 default; others: 0)
   --visual-stability-timeout=<ms>  Max wait for fonts/images before visual capture
   --preset=<name|all>           desktop, laptop, tablet, tablet-landscape, mobile, or all
   --max-items=<n>               Limit observed controls (default: 40)
@@ -3989,6 +3133,7 @@ COMMON OPTIONS:
   --idle-timeout=<ms>           Close idle sessions (default: 1800000; 0 disables)
 
 VISUAL OPTIONS:
+  --fullpage=false              Capture only the viewport (full page is the default)
   --selector=<css>              Capture one element
   --clip=x,y,w,h                Capture a region
   --hover=<css>                 Hover before capture
@@ -3996,14 +3141,7 @@ VISUAL OPTIONS:
   --size=WIDTHxHEIGHT           Custom screenshot or diff resolution
   --max-concurrency=<n>         Limit simultaneous screenshot contexts (default: 2)
   --no-freeze                   Keep page animations/transitions running during captures
-  --record                      Save video while capturing
-  --trace[=<mode>]              Workflow trace: on, on-failure, or off (default: off)
-  --trace-dir=<path>            Directory for workflow trace archives
-  --allow-sensitive-trace        Explicitly allow traces when --redact is enabled
-  --retry-side-effects          Allow retries for clicks, uploads, evaluate, and other side effects
-
 QA OPTIONS:
-  --workflow=<path>             Behavioral workflow to include in qa
   --mode=<name>                 QA scope: smoke (desktop), standard (desktop+mobile), release (all presets)
   --max-a11y-issues=<n>         Allowed accessibility findings
   --max-network-errors=<n>      Allowed HTTP/request failures
@@ -4011,9 +3149,6 @@ QA OPTIONS:
   --max-small-tap-targets=<n>   Fail QA above this many small mobile targets (report-only by default)
   --skip-layout                 Skip the mobile layout check
   --allow-overflow              Allow horizontal overflow in QA
-
-WORKFLOW OPTIONS:
-  --allow-warnings               Keep a warning workflow exit code at zero
 
 SESSION INPUT (one JSON object per line):
   {"requestId":"0","op":"capabilities"}
@@ -4029,11 +3164,6 @@ SESSION INPUT (one JSON object per line):
 
 async function cliMain() {
   const rawArgs = process.argv.slice(2);
-  if (rawArgs.length === 0 || rawArgs.includes('--help') || rawArgs.includes('-h')) {
-    showHelp();
-    return;
-  }
-
   const { positional, options } = parseCliArgs(rawArgs);
   const command = positional[0];
   const readySelector = options.ready || options['ready-selector'] || null;
@@ -4046,6 +3176,21 @@ async function cliMain() {
   let ignoreUrls = [];
 
   try {
+    if (command === 'interact') throw new BrowserToolError('RETIRED_COMMAND', 'interact is retired; use a persistent serve session and batch operations for multi-step flows.');
+    if (command === 'session') throw new BrowserToolError('RETIRED_COMMAND', 'session was an alias; use serve.');
+    const retiredOption = [...RETIRED_CLI_OPTIONS].find(name => options[name] !== undefined);
+    if (retiredOption) {
+      const reason = RETIRED_BROWSER_OPTIONS.has(retiredOption)
+        ? 'browser-tool always uses bundled Chromium.'
+        : RETIRED_VISUAL_OPTIONS.has(retiredOption)
+          ? 'video recording is retired; use screenshots.'
+        : 'file-based workflows are retired; use a persistent serve session and batch operations.';
+      throw new BrowserToolError('UNSUPPORTED_OPTION', `--${retiredOption} is not supported; ${reason}`);
+    }
+    if (rawArgs.length === 0 || rawArgs.includes('--help') || rawArgs.includes('-h')) {
+      showHelp();
+      return;
+    }
     outputLimit = normalizeOutputLimit(options.maxOutputChars ?? options['max-output-chars']);
     const printCliJson = value => printJson(value, outputLimit);
     safetyMode = normalizeSafetyMode({
@@ -4060,7 +3205,7 @@ async function cliMain() {
       else console.log(JSON.stringify(getCapabilities(), null, 2));
       return;
     }
-    if (command === 'serve' || command === 'session') {
+    if (command === 'serve') {
       await serveAgentSessions({
         headless: options.headless !== false,
 
@@ -4186,7 +3331,6 @@ async function cliMain() {
       const maxConsoleErrors = options.maxConsoleErrors ?? options['max-console-errors'];
       const qaResult = await runFullQA({
         frontendUrl: url,
-        testWorkflow: options.workflow || null,
         mode: options.mode || 'standard',
         presets: options.preset || options.presets || undefined,
         headless: options.headless !== false,
@@ -4211,9 +3355,6 @@ async function cliMain() {
         readySelector,
         readyTimeout,
         maxConcurrency: options['max-concurrency'] || DEFAULT_SCREENSHOT_CONCURRENCY,
-        trace: options.trace || 'off',
-        traceDir: options['trace-dir'] || './traces',
-        allowSensitiveTrace: Boolean(options['allow-sensitive-trace']),
         freezeAnimations,
         visualStabilityTimeout: options['visual-stability-timeout'] === undefined ? undefined : Number(options['visual-stability-timeout']),
         waitUntil: options.waitUntil || options['wait-until'] || 'domcontentloaded'
@@ -4229,11 +3370,10 @@ async function cliMain() {
 
       const result = await probeUrl({
         url,
-        delay: options.delay === undefined ? 0 : Number(options.delay),
+        delay: options.delay === undefined ? null : Number(options.delay),
         headless: options.headless !== false,
 
         takeScreenshot: Boolean(options.screenshot),
-        recordVideo: Boolean(options.record),
         authStatePath: options.auth || null,
         network: options.network || null,
         token: options.token || null,
@@ -4273,15 +3413,14 @@ async function cliMain() {
         outputDir: options.output || options.o || './screenshots',
         presets: customSizes.length > 0 && !options.preset ? [] : (options.preset || 'desktop'),
         customSizes,
-        fullPage: Boolean(options.fullpage),
+        fullPage: options.fullpage !== false,
         selector: options.selector,
         clip: options.clip || null,
         hover: options.hover || null,
-        delay: options.delay === undefined ? 0 : Number(options.delay),
+        delay: options.delay === undefined ? DEFAULT_SCREENSHOT_DELAY : Number(options.delay),
         colorScheme: options.theme || 'no-preference',
         headless: options.headless !== false,
 
-        recordVideo: Boolean(options.record),
         maxConcurrency: options['max-concurrency'] || DEFAULT_SCREENSHOT_CONCURRENCY,
         authStatePath: options.auth || null,
         network: options.network || null,
@@ -4335,7 +3474,7 @@ async function cliMain() {
         allowedHosts,
         readySelector,
         readyTimeout,
-        delay: options.delay === undefined ? 0 : Number(options.delay),
+        delay: options.delay === undefined ? DEFAULT_SCREENSHOT_DELAY : Number(options.delay),
         freezeAnimations,
         visualStabilityTimeout: options['visual-stability-timeout'] || undefined
       });
@@ -4346,64 +3485,6 @@ async function cliMain() {
         if (diffResult.diffSavedTo) console.log(`Diff Saved: ${diffResult.diffSavedTo}`);
       }
       if (!diffResult.match) process.exitCode = 1;
-      return;
-    }
-
-    if (command === 'interact') {
-      const filePath = positional[1];
-      if (!filePath) throw new BrowserToolError('MISSING_WORKFLOW', 'Workflow JSON path is required.');
-
-      const workflowData = await readWorkflowFile(filePath);
-      const steps = Array.isArray(workflowData) ? workflowData : workflowData.steps;
-
-      const result = await runWorkflow({
-        steps,
-        preset: options.preset || workflowData.preset || 'desktop',
-        headless: options.headless !== false,
-
-        recordVideo: Boolean(options.record || workflowData.record),
-        saveSnapshots: Boolean(options.snapshots || workflowData.snapshots),
-        videoDir: options['video-dir'] || workflowData.videoDir || './recordings',
-        videoFilename: options['video-filename'] || workflowData.videoFilename || null,
-        customViewport: workflowData.customViewport || null,
-        authStatePath: options.auth || workflowData.auth || null,
-        saveStatePath: options.saveState || workflowData.saveState || null,
-        permissions: options.permissions || workflowData.permissions || null,
-        permissionOrigin: options['permission-origin'] || workflowData.permissionOrigin || null,
-        network: options.network || workflowData.network || null,
-        token: options.token || workflowData.token || null,
-        cookie: options.cookie || workflowData.cookie || null,
-        geo: options.geo || workflowData.geo || null,
-        timezone: options.timezone || workflowData.timezone || null,
-        readySelector,
-        readyTimeout,
-        delay: options.delay === undefined ? (workflowData.delay || 0) : Number(options.delay),
-        redact: Boolean(options.redact || workflowData.redact),
-        safetyMode: safetyModeOptionProvided
-          ? safetyMode
-          : (workflowData.safetyMode || (workflowData.safeMode === true ? 'safe' : workflowData.unsafe === true ? 'unsafe' : safetyMode)),
-        allowedHosts: options.allowedHosts ?? options['allowed-hosts'] ?? workflowData.allowedHosts ?? allowedHosts,
-        ignoreUrls: options.ignoreUrls ?? options['ignore-urls'] ?? options.ignoreUrl ?? options['ignore-url'] ?? workflowData.ignoreUrls ?? ignoreUrls,
-        waitUntil: options.waitUntil || options['wait-until'] || workflowData.waitUntil || 'domcontentloaded',
-        trace: options.trace || workflowData.trace || 'off',
-        traceDir: options['trace-dir'] || workflowData.traceDir || './traces',
-        retrySideEffects: Boolean(options['retry-side-effects'] || workflowData.retrySideEffects),
-        allowSensitiveTrace: Boolean(options['allow-sensitive-trace'] || workflowData.allowSensitiveTrace),
-        freezeAnimations: options['no-freeze'] === true ? false : workflowData.freezeAnimations !== false,
-        visualStabilityTimeout: options['visual-stability-timeout'] || workflowData.visualStabilityTimeout || undefined
-      });
-
-      if (options.json) {
-        printCliJson(result);
-      } else {
-        console.log(`\nWorkflow Result: ${result.status.toUpperCase()} (${result.passedSteps}/${result.totalSteps} steps passed) via ${result.channelUsed}`);
-        if (result.behavioralWarnings) {
-          console.log(`⚠️ Warnings (${result.behavioralWarnings.length}):`);
-          result.behavioralWarnings.forEach(w => console.log(` - Step ${w.step}: ${w.description} -> ${w.error}`));
-        }
-        if (result.extractedData) console.log(`Extracted Data:`, result.extractedData);
-      }
-      if (result.status === 'failed' || (result.status === 'warning' && !options['allow-warnings'])) process.exitCode = 1;
       return;
     }
 

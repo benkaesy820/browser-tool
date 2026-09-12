@@ -1,6 +1,6 @@
 # Browser Tool
 
-An agent-first Playwright utility for persistent browser sessions, bounded semantic observations, health probes, responsive evidence, behavioral workflows, and visual diffs.
+An agent-first Playwright utility for persistent browser sessions, bounded semantic observations, health probes, responsive evidence, and visual diffs.
 
 ## Installation and browser policy
 
@@ -31,13 +31,13 @@ Send one JSON object per line:
 {"requestId":"5","op":"quit"}
 ```
 
-Every response echoes `requestId`; errors include a machine-readable `code`. `open` and `observe` return page identity, headings, landmarks, bounded visible text, diagnostics, and interactive controls with stable references such as `e1`. References are invalidated after actions, but stale refs are auto-recovered when the element is unambiguous (identity re-match with element-id fingerprint verification, reported as `refRecovered`; every act also reports `actedOn`), and ambiguous or missing elements fail fast with an evidenced `STALE_REF` error. Use `--max-items` and `--max-text` to control token use.
+Every response echoes `requestId`; errors include a machine-readable `code`. `open` and `observe` return page identity, headings, landmarks, bounded visible text, diagnostics, and interactive controls with observation-scoped references such as `e1`. References are invalidated after actions, but stale refs are auto-recovered when the element is unambiguous (identity re-match with element-id fingerprint verification, reported as `refRecovered`; every act also reports `actedOn`), and ambiguous or missing elements fail fast with an evidenced `STALE_REF` error. Use `--max-items` and `--max-text` to control token use.
 
-Send `{"op":"capabilities"}` first when an agent needs the protocol version, supported session/workflow actions, observation modes, event names, safety modes, or limits. The response includes default limits and maximum guardrails so an agent can plan bounded requests without trial and error.
+Send `{"op":"capabilities"}` first when an agent needs the protocol version, supported session actions, observation modes, event names, safety modes, or limits. The response includes default limits and maximum guardrails so an agent can plan bounded requests without trial and error.
 
 Use `mode:"delta"` on later session observations to receive only changed page fields and controls. `since` refers to the last observation generation; if it is stale, the tool safely falls back to a full observation.
 
-Supported session actions include `click`, `fill`, `type`, `check`, `uncheck`, `select`, `selectOption`, `hover`, `press`, `scroll`, `navigate`, `goto`, `wait`, `assert`, `dialog`, `download`, `permissions`, and `screenshot`. Workflow-only actions additionally include `upload`, `setInputFiles`, `dragAndDrop`, `drag`, `switchTab`, `mockRoute`, `mockApi`, `saveState`, `scrape`, `getText`, and `evaluate`.
+Supported session actions include `click`, `fill`, `type`, `check`, `uncheck`, `select`, `selectOption`, `hover`, `press`, `scroll`, `navigate`, `goto`, `wait`, `assert`, `dialog`, `download`, `permissions`, and `screenshot`. Trusted sessions can opt into `evaluate` with `allowEvaluate:true`.
 
 ## Agent-loop efficiency features
 
@@ -50,8 +50,7 @@ These capabilities are part of the tool; `capabilities` advertises all of them.
 {"requestId":"7","op":"act","sessionId":"app","action":"click","ref":"e3","observe":true,"mode":"delta"}
 ```
 
-The response carries `observation`, so the act → re-observe pair becomes one request.
-This option existed but was undocumented; agents should use it after every action.
+The response carries `observation`, so the act → re-observe pair becomes one request. Use it when the next decision depends on the resulting state; use `batch` for predetermined sequences.
 
 **Stale-ref auto-recovery.** Refs are invalidated after every act. When an act uses a
 ref that is no longer current, the tool re-matches the element using the semantic
@@ -128,7 +127,6 @@ browser-tool capabilities --json
 browser-tool map http://localhost:5173 --json
 browser-tool probe http://localhost:5173 --json
 browser-tool qa http://localhost:5173 --json
-browser-tool interact workflows/example.json --json
 browser-tool screenshot http://localhost:5173 --preset=mobile --json
 browser-tool diff http://localhost:5173 --baseline=baseline.png --preset=mobile --json
 browser-tool layout http://localhost:5173 --preset=mobile --json
@@ -144,65 +142,23 @@ between one-shot commands and a persistent session. The JSONL
 Useful reliability controls:
 
 - `--ready='.app-loaded'` waits for an application-owned readiness signal.
-- `--delay=250` adds an explicit post-readiness delay only when an animation needs it; the default is zero.
+- Screenshots are full-page by default and wait 250 ms after readiness. Use `--fullpage=false` for viewport-only evidence or `--delay=0` when the page is already settled.
 - `--max-concurrency=2` bounds simultaneous screenshot contexts.
 - `--mode=smoke|standard|release` selects one desktop view, desktop+mobile, or all supported viewports for `qa` (standard is the default). Smoke skips mobile layout unless a mobile preset is explicitly selected.
 - `--max-small-tap-targets=<n>` makes reported mobile tap-target findings a QA gate; without it, QA reports them without failing the run.
 - `--no-freeze` keeps animations running; captures freeze transitions and wait for fonts/images by default to reduce flaky diffs.
-- `--trace=on-failure` keeps a Playwright trace only when a workflow fails or has a warning.
-- `--allow-warnings` keeps a soft workflow warning from becoming a failing CLI exit code.
 - `--max-output-chars` caps one JSON response at a valid structured boundary (default: 20,000 characters).
-- `--safe` disables workflow evaluation, blocks unapproved cross-origin and unsafe file navigation, and keeps one-shot/workflow artifacts, uploads, and downloads inside the workspace. Add `--allowed-hosts=host1,host2` for approved extra hosts.
+- `--safe` disables session evaluation, blocks unapproved cross-origin and unsafe file navigation, and keeps artifacts and downloads inside the workspace. Add `--allowed-hosts=host1,host2` for approved extra hosts.
 - `--ignore-urls=pattern1,pattern2` filters known third-party diagnostic noise without hiding application errors by default.
 - Persistent sessions are capped at 8 and expire after 30 minutes of inactivity by default; use `--max-sessions` and `--idle-timeout` when needed.
 
-Use `--auth=state.json` for saved cookies/local storage. `--token` and `--cookie` require a target URL and are scoped to that URL's origin. Use `--redact` before screenshots or recordings of authenticated pages. Artifacts go into `screenshots/`, `recordings/`, and `traces/`; those paths are ignored by Git.
+Use `--auth=state.json` for saved cookies/local storage. `--token` and `--cookie` require a target URL and are scoped to that URL's origin. Use `--redact` before screenshots of authenticated pages. Runtime captures go into `screenshots/`, which is ignored by Git.
 
-## Traces are optional debugging evidence
+## Multi-step flows
 
-Normal browser operation does not require tracing. Enable it only while diagnosing a workflow:
+Keep `browser-tool serve` running and drive multi-step flows through `act`, `batch`, `watch`, and `subscribe`. Shell scripts can write JSONL requests to the same persistent process without creating workflow files; use selectors inside `batch`, assert important states explicitly, and preserve the per-step response as evidence.
 
-```bash
-browser-tool interact workflows/example.json --trace=on-failure --json
-npx playwright show-trace traces/workflow-<timestamp>.zip
-```
-
-The trace viewer is provided by the pinned Playwright package; it is not a second browser engine and it is not needed for routine checks. Traces can contain DOM snapshots and network details. When `--redact` is enabled, tracing is blocked unless `--allow-sensitive-trace` is explicitly supplied; redaction does not rewrite trace archives.
-
-## Workflow example
-
-```json
-{
-  "preset": "desktop",
-  "steps": [
-    {"action":"navigate","url":"http://localhost:5173/login"},
-    {"action":"fill","selector":"#email","text":"test@example.com"},
-    {"action":"click","selector":"button[type=submit]"},
-    {"action":"assert","selector":"h1","containsText":"Dashboard"}
-  ]
-}
-```
-
-Workflows support the action identifiers above, including iframes through `frame`. A `press` step with `selector` targets that element; a bare `scroll` moves to the bottom of the document. Put a `dialog` step immediately before the action that opens the dialog; it accepts or dismisses the next dialog and fails if none appears, including when the workflow ends early. Retry counts must be integers from 0 to 10. Non-idempotent actions are not retried unless `retrySideEffects` or `--retry-side-effects` is explicitly enabled. Use `safetyMode:"safe"` for untrusted workflows.
-
-Workflow files are validated before browser launch, limited to 200 steps and 2 MB, and reject unknown actions or malformed required fields.
-
-Safe workflow mode also validates the real filesystem path of generated videos, traces, failure snapshots, and saved state, including symlink/junction targets, before writing them. The CLI preserves non-boolean values as strings so numeric-looking tokens, cookies, paths, and selectors are not silently changed.
-
-Example of browser-controlled side effects:
-
-```json
-[
-  {"action":"dialog","type":"accept","promptText":"yes"},
-  {"action":"click","selector":"#confirm"},
-  {"action":"download","selector":"#export","dir":"./downloads"},
-  {"action":"permissions","permissions":["geolocation"],"origin":"http://localhost:5173"}
-]
-```
-
-`qa` launches one browser process and reuses it across probe, responsive, layout, and workflow checks. Each check still gets an isolated context, so the speedup does not merge cookies or page state between checks.
-
-Local fixture workflows can use `file://{{cwd}}/fixtures/...`; the placeholder resolves to the current checkout, so the examples work on Linux, macOS, Windows, and PowerShell without editing a hardcoded path.
+`qa` launches one browser process and reuses it across probe, responsive, and layout checks. Each check still gets an isolated context, so the speedup does not merge cookies or page state between checks.
 
 For visual regression, keep committed baselines under `tests/visual-baselines/`; runtime captures remain ignored. Use the same `--preset` or `--size` when creating and comparing a baseline.
 
@@ -210,11 +166,11 @@ For visual regression, keep committed baselines under `tests/visual-baselines/`;
 
 ```bash
 npm ci
-npm run test:cli
 npm test
+npm run test:live
 node --check browser-tool.mjs
 ```
 
-The package intentionally does not include broad crawlers, API harvesters, PDF export, token extraction, component ripping, DOM search, workflow code generation, or automatic public form-filling. Those features create output and maintenance cost without improving the core agent loop; workflows can still perform explicit form actions safely.
+The package intentionally does not include file-based workflows, broad crawlers, API harvesters, PDF export, token extraction, component ripping, DOM search, code generation, or automatic public form-filling. Those features create output and maintenance cost without improving the persistent agent loop.
 
-Official Playwright references: [browser installation](https://playwright.dev/docs/browsers), [trace viewer](https://playwright.dev/docs/trace-viewer), and [tracing API](https://playwright.dev/docs/api/class-tracing).
+Official Playwright reference: [browser installation](https://playwright.dev/docs/browsers).

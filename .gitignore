@@ -1,15 +1,11 @@
 node_modules/
 
 screenshots/
-recordings/
-traces/
 downloads/
 .playwright-browsers/
-qa-report.html
 
 auth*.json
 *.auth.json
-*.webm
 *.png
 *.zip
 *.log
@@ -52,4 +48,3 @@ Thumbs.db
 
 # Sensitive files (auto-detected)
 node_modules
-
