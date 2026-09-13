@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bridge Fixture — Shop</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    .card { border: 1px solid #ccc; padding: 1rem; border-radius: 8px; }
+    #result { margin-top: 1rem; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Bridge Fixture — Shop</h1>
+  <div class="card">
+    <label for="item">Item name</label>
+    <input id="item" name="item" type="text" placeholder="e.g. apples" />
+    <button id="add" type="button">Add to cart</button>
+    <div id="result" role="status" aria-live="polite"></div>
+  </div>
+
+  <h2>Ambiguity trap</h2>
+  <button type="button" onclick="document.getElementById('dup-out').textContent='first'">More info</button>
+  <button type="button" onclick="document.getElementById('dup-out').textContent='second'">More info</button>
+  <div id="dup-out" role="status"></div>
+
+  <h2>Disabled control</h2>
+  <button id="disabled-btn" type="button" disabled>Checkout (disabled)</button>
+
+  <h2>Form controls (Phase 1)</h2>
+  <label for="choice">Choice</label>
+  <select id="choice">
+    <option value="">Pick one</option>
+    <option value="a">Alpha</option>
+    <option value="b">Beta</option>
+  </select>
+  <label><input id="agree" type="checkbox" /> I agree</label>
+  <div id="choice-out" role="status"></div>
+  <div id="agree-out" role="status"></div>
+  <label for="range">Range</label>
+  <input id="range" type="range" min="0" max="100" value="0" />
+  <div id="range-out" role="status">Range: 0</div>
+
+  <h2>Diagnostics + hover (Phase 1)</h2>
+  <button id="boom" type="button">Log console error</button>
+  <button id="fail-req" type="button">Fail a request</button>
+  <button id="hover-me" type="button">Hover me</button>
+  <div id="hover-out" role="status"></div>
+
+  <h2>Popup + iframe (spike targets)</h2>
+  <a id="popup-link" href="popup.html" target="_blank" rel="noopener">Open popup</a>
+  <iframe id="inner-frame" title="inner" src="inner.html" width="300" height="120"></iframe>
+
+  <script>
+    document.getElementById('add').addEventListener('click', () => {
+      const v = document.getElementById('item').value.trim();
+      document.getElementById('result').textContent = v ? `Item added: ${v}` : 'Enter an item name';
+    });
+    document.getElementById('choice').addEventListener('change', (ev) => {
+      document.getElementById('choice-out').textContent = `Choice: ${ev.target.value || 'none'}`;
+    });
+    document.getElementById('agree').addEventListener('change', (ev) => {
+      document.getElementById('agree-out').textContent = ev.target.checked ? 'Agree: on' : 'Agree: off';
+    });
+    document.getElementById('range').addEventListener('input', (ev) => {
+      document.getElementById('range-out').textContent = `Range: ${ev.target.value}`;
+    });
+    document.getElementById('boom').addEventListener('click', () => {
+      console.error('boom-42');
+    });
+    document.getElementById('fail-req').addEventListener('click', () => {
+      // Closed port: deterministically refused, no network dependency.
+      fetch('http://127.0.0.1:9/bridge-fixture-probe').catch(() => {});
+    });
+    document.getElementById('hover-me').addEventListener('mouseover', () => {
+      document.getElementById('hover-out').textContent = 'hovered';
+    });
+  </script>
+</body>
+</html>

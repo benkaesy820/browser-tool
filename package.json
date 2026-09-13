@@ -1,0 +1,36 @@
+{
+  "name": "browser-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone browser service for CLI agents (Browser Bridge) — Phase 0 foundation",
+  "packageManager": "pnpm@10.17.0",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check:shadows": "node scripts/check-shadows.mjs",
+    "test": "node scripts/check-shadows.mjs && vitest run tests/unit",
+    "test:contract": "node scripts/check-shadows.mjs && vitest run tests/contract",
+    "test:integration": "node scripts/check-shadows.mjs && vitest run tests/integration",
+    "test:interop": "node scripts/check-shadows.mjs && vitest run tests/interoperability",
+    "lint": "eslint packages tests apps scripts",
+    "format:check": "prettier --check \"packages/**/src/**/*.ts\" \"tests/**/*.ts\" \"apps/viewer/src/**/*.{ts,tsx}\" \"scripts/**/*.mjs\"",
+    "build": "pnpm -r build",
+    "test:package": "node scripts/test-package.mjs",
+    "test:benchmark": "vitest run tests/benchmarks",
+    "benchmark": "vitest run tests/benchmarks && node scripts/benchmark.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.23.0",
+    "@modelcontextprotocol/sdk": "1.20.1",
+    "@types/node": "22.10.2",
+    "eslint": "9.23.0",
+    "playwright": "1.49.1",
+    "prettier": "3.4.2",
+    "typescript": "5.7.2",
+    "typescript-eslint": "8.29.0",
+    "vitest": "2.1.8"
+  }
+}

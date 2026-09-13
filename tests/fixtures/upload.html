@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>Upload (static)</title></head>
+<body>
+<h1>Upload (static)</h1>
+<label for="file">File</label><input id="file" type="file" />
+<div id="out" role="status"></div>
+<script>document.getElementById('file').addEventListener('change', (e) => {
+document.getElementById('out').textContent = 'picked: ' + (e.target.files[0]?.name ?? 'none'); });</script>
+</body>
+</html>

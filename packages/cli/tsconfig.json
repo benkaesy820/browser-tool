@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "paths": {
+      "@browser-bridge/protocol": ["../protocol/dist/index.d.ts"],
+      "@browser-bridge/core": ["../core/dist/index.d.ts"],
+      "@browser-bridge/mcp": ["../mcp/dist/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

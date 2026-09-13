@@ -1,0 +1,36 @@
+{
+  "name": "@browser-bridge/cli",
+  "version": "0.5.0",
+  "type": "module",
+  "bin": {
+    "bridge": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepack": "node ../../scripts/prepack-pkg.mjs --bundle-viewer"
+  },
+  "dependencies": {
+    "@browser-bridge/core": "workspace:*",
+    "@browser-bridge/mcp": "workspace:*",
+    "@browser-bridge/protocol": "workspace:*",
+    "commander": "12.1.0",
+    "fastify": "5.2.1",
+    "pino": "9.6.0",
+    "playwright": "1.49.1"
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "viewer-dist",
+    "LICENSE"
+  ]
+}

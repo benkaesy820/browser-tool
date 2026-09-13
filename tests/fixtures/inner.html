@@ -1,0 +1,5 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>Inner</title></head>
+<body><p id="inner-text">Inside iframe</p><button id="inner-btn" type="button">Inner button</button>
+<script>document.getElementById('inner-btn').addEventListener('click', () => { document.getElementById('inner-text').textContent = 'inner clicked'; });</script></body>
+</html>

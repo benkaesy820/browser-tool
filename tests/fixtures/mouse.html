@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Bridge Mouse Fixture</title>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; }
+    #target { margin: 80px; width: 220px; height: 80px; }
+    #status { position: fixed; top: 8px; left: 8px; background: white; z-index: 2; }
+    #space { height: 2400px; }
+  </style>
+</head>
+<body>
+  <div id="status" role="status">ready</div>
+  <button id="target" type="button">Mouse target</button>
+  <div id="space"></div>
+  <script>
+    const status = document.getElementById('status');
+    const target = document.getElementById('target');
+    document.addEventListener('pointermove', (event) => {
+      if (event.target.closest?.('#target')) status.textContent = 'move';
+    });
+    document.addEventListener('contextmenu', (event) => {
+      if (!event.target.closest?.('#target')) return;
+      event.preventDefault();
+      status.textContent = 'context';
+    });
+    document.addEventListener('dblclick', (event) => {
+      if (!event.target.closest?.('#target')) return;
+      status.textContent = 'double';
+    });
+    window.addEventListener('scroll', () => {
+      status.textContent = `scroll:${Math.round(window.scrollY)}`;
+    });
+  </script>
+</body>
+</html>

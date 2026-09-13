@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "browser-bridge": {
+      "command": "bridge",
+      "args": ["mcp", "--stdio"],
+      "env": {
+        "BRIDGE_LOG_LEVEL": "warn"
+      }
+    }
+  }
+}
